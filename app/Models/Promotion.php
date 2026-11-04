@@ -1,0 +1,49 @@
+<?php
+
+namespace App\Models;
+
+use App\User;
+use Eloquent;
+use App\Models\Concerns\BelongsToSchool;
+use App\Models\Concerns\SynchronizesPromotionYears;
+
+class Promotion extends Eloquent
+{
+    use BelongsToSchool, SynchronizesPromotionYears;
+    protected $fillable = ['from_class', 'from_section', 'to_class', 'to_section', 'grad', 'student_id', 'from_session', 'to_session', 'status', 'from_academic_year_id', 'to_academic_year_id'];
+
+    public function fromAcademicYear()
+    {
+        return $this->belongsTo(AcademicYear::class, 'from_academic_year_id');
+    }
+
+    public function toAcademicYear()
+    {
+        return $this->belongsTo(AcademicYear::class, 'to_academic_year_id');
+    }
+
+    public function student()
+    {
+        return $this->belongsTo(User::class, 'student_id');
+    }
+
+    public function fc()
+    {
+        return $this->belongsTo(MyClass::class, 'from_class');
+    }
+
+    public function fs()
+    {
+        return $this->belongsTo(Section::class, 'from_section');
+    }
+
+    public function ts()
+    {
+        return $this->belongsTo(Section::class, 'to_section');
+    }
+
+    public function tc()
+    {
+        return $this->belongsTo(MyClass::class, 'to_class');
+    }
+}
