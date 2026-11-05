@@ -104,11 +104,12 @@ grant select, insert, update on private.provisioning_requests to service_role;
 create index provisioning_requests_state_updated_idx on private.provisioning_requests(state, updated_at);
 create index provisioning_requests_actor_created_idx on private.provisioning_requests(actor_auth_user_id, created_at desc);
 
--- The profile/school RPCs below are SECURITY INVOKER by design. Grant the
--- service role only the base-table operations they execute; browser roles
--- remain revoked and no RLS policies are added here. SECURITY INVOKER still
--- runs with service_role's bypass-RLS capability, so its key must remain
--- server-only and every write path must retain the actor/tenant checks below.
+-- The profile/school RPCs below are SECURITY INVOKER by design. Add the
+-- base-table privileges those RPCs require to the project's existing
+-- service_role grants; do not rewrite that role's pre-existing privileges.
+-- Browser roles remain revoked and no RLS policies are added here.
+-- SECURITY INVOKER runs with service_role's bypass-RLS capability, so its key
+-- must remain server-only and every write path must retain actor/tenant checks.
 grant usage on schema public, auth to service_role;
 grant select on auth.users to service_role;
 grant select, insert on public.users, public.schools to service_role;

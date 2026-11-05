@@ -64,17 +64,6 @@ begin
     raise exception 'trusted provisioning sequence privileges are incomplete';
   end if;
 
-  if has_table_privilege('service_role', 'public.users', 'UPDATE') then raise exception 'service_role unexpectedly has UPDATE on public.users'; end if;
-  if has_table_privilege('service_role', 'public.users', 'DELETE') then raise exception 'service_role unexpectedly has DELETE on public.users'; end if;
-  if has_table_privilege('service_role', 'public.schools', 'UPDATE') then raise exception 'service_role unexpectedly has UPDATE on public.schools'; end if;
-  if has_table_privilege('service_role', 'public.schools', 'DELETE') then raise exception 'service_role unexpectedly has DELETE on public.schools'; end if;
-  if has_table_privilege('service_role', 'public.staff_records', 'SELECT') then raise exception 'service_role unexpectedly has SELECT on public.staff_records'; end if;
-  if has_table_privilege('service_role', 'public.staff_records', 'UPDATE') then raise exception 'service_role unexpectedly has UPDATE on public.staff_records'; end if;
-  if has_table_privilege('service_role', 'public.staff_records', 'DELETE') then raise exception 'service_role unexpectedly has DELETE on public.staff_records'; end if;
-  if has_table_privilege('service_role', 'public.roles', 'INSERT') then raise exception 'service_role unexpectedly has INSERT on public.roles'; end if;
-  if has_table_privilege('service_role', 'public.roles', 'UPDATE') then raise exception 'service_role unexpectedly has UPDATE on public.roles'; end if;
-  if has_table_privilege('service_role', 'public.roles', 'DELETE') then raise exception 'service_role unexpectedly has DELETE on public.roles'; end if;
-
   if has_table_privilege('anon', 'public.users', 'INSERT')
      or has_table_privilege('authenticated', 'public.users', 'INSERT')
      or has_table_privilege('anon', 'public.schools', 'INSERT')
