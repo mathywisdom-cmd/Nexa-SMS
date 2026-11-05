@@ -15,9 +15,6 @@
     "vue": "3.5.17",
     "vue-tsc": "2.2.12"
   },
-  "devDependencies": {
-    "@esbuild/win32-x64": "0.25.12"
-  },
   "allowScripts": {
     "esbuild": true
   }
