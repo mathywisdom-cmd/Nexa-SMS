@@ -127,6 +127,15 @@ jobs:
           extensions: bcmath, ctype, curl, fileinfo, json, mbstring, openssl, pdo_sqlite, tokenizer, xml, zip
           coverage: none
 
+      - name: Prepare Laravel runtime directories
+        run: |
+          mkdir -p storage/framework/cache/data \
+            storage/framework/sessions \
+            storage/framework/testing \
+            storage/framework/views \
+            storage/logs \
+            bootstrap/cache
+
       - name: Install Laravel dependencies
         run: composer install --no-interaction --prefer-dist --no-progress
 

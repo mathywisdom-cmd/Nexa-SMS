@@ -21,7 +21,11 @@ Reviewing the retry assertion against the SQL exposed a confirmed defect in the 
 
 ## Runtime coverage limits
 
-The CI job is defined but **has not run**. The repository currently has uncommitted work, and the user prohibited commit/push. GitHub cannot execute this new workflow until it is committed and pushed or otherwise made available on a GitHub PR. Therefore no migration, SQL, Deno, Auth/JWT, concurrency, RLS, or PHPUnit result is yet claimed.
+The first published run was `42103654559` on commit `a44b07d486577cd938214f2f915d93a0786b68cd`. It failed before any authorization assertions ran. The Supabase CLI applied the first two files in the migration directory in timestamp order: the historical `20261104000000_nexasms_existing_schema_proposal.sql` draft created the application tables, then `20261104164653_nexasms_initial_schema_20261104.sql` failed because `public.blood_groups` already existed. The proposal draft and the old `20261104170421_stage1_authorization_foundation.sql` draft are preserved byte-for-byte under `supabase/proposals/`; they are not part of the nine-migration history applied to the hosted project and must not be replayed as active migrations. They are removed from `supabase/migrations/` so a fresh local reset uses only the reconciled migration chain plus the rejected authentication proposal under test.
+
+The same first run's Laravel job failed during Composer's `post-autoload-dump` package discovery because Laravel's writable framework/cache directories are intentionally absent from a clean checkout. The workflow now creates those disposable runner directories before installing dependencies. These CI corrections do not touch the hosted Supabase project or modify the Laravel application.
+
+The corrected workflow will be pushed as a follow-up commit. Its actual result will be recorded below after completion; until then no SQL, Deno, Auth/JWT, concurrency, RLS, or PHPUnit checks are claimed passed.
 
 After it runs, inspect any failures before treating the migration as approved. Some fault modes cannot be induced reliably in the real local stack (network timeout after Auth write, failed Auth compensation, lost PostgREST response, and exact lease-expiry race); the existing fake-service suite covers modeled variants only. The runtime suite currently verifies live lease renewal and competing claims, but does not wait ten minutes to test a real database lease expiration/reclaim. A real concurrent owner wave tests the database-level single-owner lock/index; school and staff provisioning are performed for separate tenants and tenant reads are checked under real Auth JWTs.
 
@@ -45,4 +49,13 @@ No `supabase link`, `supabase db push`, hosted migration, Edge Function deployme
 
 ## Running it and approval boundary
 
-The workflow listens for pushes and pull requests targeting `deployment/vercel-supabase-poc`, plus manual dispatch. Since committing and pushing are not authorized, a project owner must publish the reviewed workflow (or open a PR containing it) before GitHub Actions can produce actual results. Review every failing log and resulting diff; do not apply the rejected migration to the existing hosted project based only on a passing isolated run. An independent security review and explicit production approval remain required before hosted SQL or function deployment.
+The workflow listens for pushes and pull requests targeting `deployment/vercel-supabase-poc`, plus manual dispatch. Review every failing log and resulting diff; do not apply the rejected migration to the existing hosted project based only on a passing isolated run. An independent security review and explicit production approval remain required before hosted SQL or function deployment.
+
+## First-run diagnosis and correction
+
+Run `42103654559` failed in both jobs before test execution:
+
+- Supabase local startup stopped at `20261104164653_nexasms_initial_schema_20261104.sql`, statement 3, with PostgreSQL `42P07: relation "blood_groups" already exists`. The earlier proposal-only draft was incorrectly inside the active migrations directory and had already created the table. The exact draft remains preserved in `supabase/proposals/` and is excluded from the active migration chain.
+- Laravel Composer dependency installation stopped in `artisan package:discover` with `InvalidArgumentException: Please provide a valid cache path.` A clean checkout does not contain generated `storage/framework/*` or `bootstrap/cache` directories. The workflow creates these directories on the ephemeral runner before Composer runs.
+
+No integration test results came from that run: SQL catalog tests, Deno tests, Auth/RLS integration checks, and PHPUnit were skipped after setup failures. The corrected follow-up workflow run is pending/result not yet recorded.
