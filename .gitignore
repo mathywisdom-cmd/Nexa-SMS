@@ -35,6 +35,9 @@ storage/
 *.sqlite3
 *.db
 *.sql
+!/supabase/migrations/20261104000000_nexasms_existing_schema_proposal.sql
+!/supabase/migrations/20261104170421_stage1_authorization_foundation.sql
+!/supabase/tests/stage1_authorization_foundation.sql
 
 # Private credentials, keys, and certificates
 *.pem
@@ -54,6 +57,8 @@ secrets.json
 # Generated frontend/build artifacts and temporary files
 /public/build/
 /public/mix-manifest.json
+/frontend/node_modules/
+/frontend/dist/
 *.tmp
 *.temp
 *.log
