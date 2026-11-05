@@ -237,6 +237,29 @@ Deno.test('real local Auth, provisioning authorization, tenant isolation, leases
     const teacherB = await createTeacher(schoolB, 'B')
     authIds.push(teacherB.authId)
 
+    // A retry after the Auth identity was durably linked must resume in
+    // identity_created; returning to pending would make the profile RPC reject
+    // the request even though its Auth identity already exists.
+    const retryId = requestId()
+    const retryEmail = `ci-profile-retry-${suffix}@example.test`
+    const retryAuthId = await createIdentity(retryEmail, retryId)
+    authIds.push(retryAuthId)
+    const retryPayload = {
+      name: 'CI Retry Teacher', email: retryEmail, user_type: 'teacher',
+      username: `CI-RETRY-${suffix}`, gender: 'Other', phone: null,
+      address: 'CI retry validation', state_id: 1, lga_id: 1, nal_id: 1, emp_date: null,
+    }
+    await reserve(retryId, 'school_user_create', schoolA.adminAuthId, retryPayload)
+    const initialRetryLease = await claimAndBind(retryId, retryAuthId)
+    const simulatedProfileFailure = await service.rpc('transition_provisioning_request', {
+      p_request_id: retryId, p_next_state: 'failed_recoverable', p_error_code: 'profile_write_failed',
+      p_recovery_actor_auth_user_id: null, p_lease_token: initialRetryLease,
+    })
+    assert(!simulatedProfileFailure.error, `could not set up profile-retry scenario: ${simulatedProfileFailure.error?.message ?? 'unknown'}`)
+    const resumedRetry = await reserve(retryId, 'school_user_create', schoolA.adminAuthId, retryPayload)
+    assert(resumedRetry.state === 'identity_created' && resumedRetry.auth_user_id === retryAuthId,
+      'profile retry did not resume from the already linked Auth identity')
+
     const adminA = await signIn(schoolA.adminEmail)
     const adminB = await signIn(schoolB.adminEmail)
     const contextA = await adminA.rpc('get_my_auth_context')

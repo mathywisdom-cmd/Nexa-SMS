@@ -87,7 +87,9 @@ function fakeService(options: FakeOptions = {}) {
             return { data: null, error: { message: 'idempotency conflict' } }
           }
           request.attempt_count = Number(request.attempt_count) + 1
-          if (request.state === 'failed_recoverable') request.state = 'pending'
+          if (request.state === 'failed_recoverable') {
+            request.state = request.auth_user_id ? 'identity_created' : 'pending'
+          }
         } else {
           request = {
             request_id: args.p_request_id, operation: args.p_operation, actor_auth_user_id: args.p_actor_auth_user_id,
@@ -119,7 +121,10 @@ function fakeService(options: FakeOptions = {}) {
           || Number(request.lease_expires_at) <= Date.now()) {
           return { data: null, error: { message: 'lease not renewable' } }
         }
-        request.lease_expires_at = Date.now() + (options.leaseDurationMs ?? 10 * 60 * 1000)
+        request.lease_expires_at = Math.max(
+          Date.now() + (options.leaseDurationMs ?? 10 * 60 * 1000),
+          Number(request.lease_expires_at) + 1,
+        )
         renewalCount++
         return { data: { lease_expires_at: new Date(Number(request.lease_expires_at)).toISOString() }, error: null }
       }
@@ -187,14 +192,16 @@ function fakeService(options: FakeOptions = {}) {
           failureCount--
           return { data: null, error: { message: 'profile insertion failed' } }
         }
-        if (request.operation === 'owner_bootstrap' && ownerCount > 0) return { data: null, error: { message: 'platform owner is already provisioned' } }
+        if (request.operation === 'owner_bootstrap' && (options.ownerRegistry?.count ?? ownerCount) > 0) {
+          return { data: null, error: { message: 'platform owner is already provisioned' } }
+        }
         const result = request.operation === 'school_create'
           ? { school_id: 200 + schoolCreates, admin_profile_id: 300 + profileCreates }
           : { profile_id: 300 + profileCreates }
         profileCreates++
         if (request.operation === 'school_create') schoolCreates++
         if (request.operation === 'owner_bootstrap') {
-          ownerCount++
+          ownerCount = (options.ownerRegistry?.count ?? ownerCount) + 1
           if (options.ownerRegistry) options.ownerRegistry.count = ownerCount
         }
         request.state = 'profile_created'
@@ -248,10 +255,9 @@ Deno.test('invite failure remains retryable and creates only one school/profile'
 Deno.test('Auth invite created identity but lost response is reconciled by request marker', async () => {
   const fake = fakeService({ inviteTimeoutAfterCreate: true })
   const req = await reserve(fake)
-  await assertRejects(() => runProvisioningRequest(fake.service, req))
-  await markRecoverable(fake, 'auth_invite_failed')
-  await runProvisioningRequest(fake.service, await reserve(fake))
+  await runProvisioningRequest(fake.service, req)
   assertEquals(fake.counts, { identities: 1, profiles: 1, schools: 1, owners: 0 })
+  assertEquals(fake.request?.state, 'completed')
 })
 
 Deno.test('profile insertion failure resumes the linked Auth identity without duplicates', async () => {

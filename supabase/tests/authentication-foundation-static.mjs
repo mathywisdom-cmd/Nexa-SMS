@@ -46,6 +46,8 @@ assert.equal((sql.match(/set_config\('request\.jwt\.claim\.sub',\s*p_actor_auth_
 assert.match(sql, /create\s+table\s+private\.provisioning_requests/i)
 assert.match(sql, /request_row\.payload_hash\s*<>\s*p_payload_hash[\s\S]*?request_row\.state\s+not\s+in\s*\('completed',\s*'failed_terminal'\)\s+and\s+request_row\.payload\s*<>\s*p_payload/i,
   'completed or terminal idempotency retries must compare the retained payload hash after clearing payload data')
+assert.match(sql, /state\s*=\s*case\s+when\s+auth_user_id\s+is\s+null\s+then\s+'pending'\s+else\s+'identity_created'\s+end/i,
+  'recoverable requests with a linked Auth identity must resume at identity_created')
 assert.match(sql, /provisioning_payload_has_credentials\(payload\)/i)
 assert.match(sql, /jsonb_array_elements\(p_value\)/i)
 assert.match(sql, /state\s+in\s*\('pending',\s*'identity_created',\s*'profile_created',\s*'completed',\s*'failed_recoverable',\s*'failed_terminal',\s*'cancelling'\)/i)
@@ -135,6 +137,9 @@ for (const scenario of [
   'lease renewal rejects cancellation and terminal states',
   'renewal failure stops provisioning',
 ]) assert.ok(recoveryTests.includes(scenario), `missing provisioning recovery test: ${scenario}`)
+const integrationTests = readFileSync(path.join(root, 'supabase/tests/authentication-provisioning.integration.ts'), 'utf8')
+assert.match(integrationTests, /resumedRetry\.state\s*===\s*'identity_created'[\s\S]*?resumedRetry\.auth_user_id\s*===\s*retryAuthId/,
+  'PostgreSQL/Auth integration suite must verify that a linked identity retry resumes at identity_created')
 
 const laravelProvider = readFileSync(path.join(root, 'app/Auth/LegacyPasswordUserProvider.php'), 'utf8')
 assert.equal((laravelProvider.match(/whereNotNull\('password'\)/g) ?? []).length, 3)

@@ -152,7 +152,12 @@ begin
       raise exception 'idempotency key conflicts with a different provisioning request';
     end if;
     if request_row.state = 'failed_recoverable' then
-      update private.provisioning_requests set state = 'pending', error_code = null,
+      -- If the Auth identity was already recorded before the recoverable
+      -- failure, resume at identity_created so the profile RPC's precondition
+      -- remains true. Only requests with no linked identity restart at pending.
+      update private.provisioning_requests set
+        state = case when auth_user_id is null then 'pending' else 'identity_created' end,
+        error_code = null,
         lease_token = null, lease_expires_at = null, updated_at = now()
        where request_id = p_request_id returning * into request_row;
     end if;
