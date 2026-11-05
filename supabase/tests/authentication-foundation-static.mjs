@@ -8,7 +8,26 @@ const sql = readFileSync(path.join(root, 'supabase/migrations/20261105161648_aut
 const databaseTest = readFileSync(path.join(root, 'supabase/tests/authentication_foundation.sql'), 'utf8')
 
 function normalizeTypes(value) {
-  return value.split(',').map(part => part.trim().split(/\s+/).at(-1).toLowerCase()).join(',')
+  const aliases = new Map([
+    ['smallint', 'int2'],
+    ['integer', 'int4'],
+    ['int', 'int4'],
+    ['bigint', 'int8'],
+    ['decimal', 'numeric'],
+    ['real', 'float4'],
+    ['double precision', 'float8'],
+    ['boolean', 'bool'],
+    ['character varying', 'varchar'],
+    ['timestamp with time zone', 'timestamptz'],
+    ['timestamp without time zone', 'timestamp'],
+    ['time with time zone', 'timetz'],
+    ['time without time zone', 'time'],
+  ])
+
+  return value.split(',').map(part => {
+    const type = part.trim().toLowerCase().replace(/\s+/g, ' ')
+    return aliases.get(type) ?? type
+  }).join(',')
 }
 
 const declarations = new Map()
@@ -16,7 +35,12 @@ const parameterNames = new Map()
 for (const match of sql.matchAll(/create\s+or\s+replace\s+function\s+([\w.]+)\s*\(([\s\S]*?)\)\s*returns/gi)) {
   const args = match[2].trim()
   const parts = args ? args.split(',').map(arg => arg.trim().split(/\s+/)) : []
-  const types = parts.map(arg => arg.slice(0, arg.findIndex(token => token.toLowerCase() === 'default') < 0 ? arg.length : arg.findIndex(token => token.toLowerCase() === 'default')).at(-1))
+  const types = parts.map(arg => {
+    const defaultIndex = arg.findIndex(token => token.toLowerCase() === 'default')
+    const declaration = arg.slice(0, defaultIndex < 0 ? arg.length : defaultIndex)
+    const modeOffset = ['in', 'out', 'inout', 'variadic'].includes(declaration[0].toLowerCase()) ? 1 : 0
+    return declaration.slice(modeOffset + 1).join(' ')
+  })
   declarations.set(match[1].toLowerCase(), normalizeTypes(types.join(',')))
   parameterNames.set(match[1].toLowerCase(), parts.map(arg => arg[0]))
 }
