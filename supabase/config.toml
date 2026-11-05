@@ -1,0 +1,21 @@
+project_id = "vyiyveqnsjyxrekbwdeg"
+
+[auth]
+enable_signup = false
+
+[functions.login-username]
+verify_jwt = false
+
+[functions.bootstrap-owner]
+verify_jwt = false
+
+[functions.provisioning-recovery]
+# The function verifies platform-owner JWTs itself and also accepts a separate
+# operator token for first-owner recovery before any owner Auth identity exists.
+verify_jwt = false
+
+[functions.provision-school]
+verify_jwt = true
+
+[functions.provision-school-user]
+verify_jwt = true

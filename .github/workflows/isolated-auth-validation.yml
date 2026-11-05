@@ -1,0 +1,139 @@
+name: Isolated NexaSMS authentication validation
+
+on:
+  pull_request:
+    branches: [deployment/vercel-supabase-poc]
+  push:
+    branches: [deployment/vercel-supabase-poc]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nexasms-auth-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  supabase-local:
+    name: Disposable Supabase migration and authorization tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v3
+        with:
+          version: v2.stable
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Start isolated Supabase stack
+        run: supabase start
+
+      - name: Install PostgreSQL client for session-context assertions
+        run: sudo apt-get update && sudo apt-get install --yes postgresql-client
+
+      - name: Apply every migration to a fresh local database
+        run: supabase db reset --local --no-seed
+
+      - name: Export local-only Supabase endpoints to this step environment
+        shell: bash
+        run: |
+          set +x
+          eval "$(supabase status -o env)"
+          {
+            echo "SUPABASE_URL=$API_URL"
+            echo "SUPABASE_ANON_KEY=$ANON_KEY"
+            echo "SUPABASE_SERVICE_ROLE_KEY=$SERVICE_ROLE_KEY"
+            echo "SUPABASE_DB_URL=$DB_URL"
+          } >> "$GITHUB_ENV"
+          echo "Local disposable Supabase endpoints configured (values omitted)."
+
+      - name: Check migration function signatures statically
+        run: node supabase/tests/authentication-foundation-static.mjs
+
+      - name: Check database ownership, grants, RLS, and nullable-password catalog state
+        shell: bash
+        run: |
+          set +x
+          eval "$(supabase status -o env)"
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/authentication_foundation.sql
+
+      - name: Run mocked provisioning recovery tests
+        run: deno test --allow-env --allow-net supabase/tests/provisioning-recovery.test.ts
+
+      - name: Start local Edge Functions with disposable generated secrets
+        shell: bash
+        run: |
+          set +x
+          OWNER_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)"
+          OPERATOR_TOKEN="$(openssl rand -hex 32)"
+          echo "::add-mask::${OWNER_BOOTSTRAP_TOKEN}"
+          echo "::add-mask::${OPERATOR_TOKEN}"
+          FUNCTIONS_URL="${SUPABASE_URL}/functions/v1"
+          {
+            echo "SUPABASE_URL=${SUPABASE_URL}"
+            echo "SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}"
+            echo "SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}"
+            echo "NEXASMS_OWNER_BOOTSTRAP_TOKEN=${OWNER_BOOTSTRAP_TOKEN}"
+            echo "NEXASMS_PROVISIONING_OPERATOR_TOKEN=${OPERATOR_TOKEN}"
+          } > "$RUNNER_TEMP/nexasms-functions.env"
+          chmod 600 "$RUNNER_TEMP/nexasms-functions.env"
+          echo "SUPABASE_FUNCTIONS_URL=${FUNCTIONS_URL}" >> "$GITHUB_ENV"
+          supabase functions serve --env-file "$RUNNER_TEMP/nexasms-functions.env" > "$RUNNER_TEMP/nexasms-functions.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/nexasms-functions.pid"
+          for attempt in $(seq 1 60); do
+            if curl --silent --output /dev/null --write-out '%{http_code}' \
+              -X POST "${FUNCTIONS_URL}/login-username" \
+              -H "apikey: ${SUPABASE_ANON_KEY}" -H 'content-type: application/json' \
+              --data '{"identity":"","password":""}' | grep -q '^401$'; then
+              echo "Local Edge Runtime is serving the username-login function."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Local Edge Runtime did not become ready; its credential-bearing environment/log is intentionally not printed."
+          exit 1
+
+      - name: Type-check Edge Functions and integration suite
+        run: deno check supabase/functions/*/index.ts supabase/tests/authentication-provisioning.integration.ts
+
+      - name: Exercise real local Auth, SQL RPCs, tenant reads, and recovery transitions
+        run: deno test --allow-env --allow-net --allow-run=psql supabase/tests/authentication-provisioning.integration.ts
+
+      - name: Stop disposable Supabase stack
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/nexasms-functions.pid" ]; then kill "$(cat "$RUNNER_TEMP/nexasms-functions.pid")" || true; fi
+          supabase stop --no-backup
+
+  laravel-password-compatibility:
+    name: Legacy Laravel password compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.0'
+          extensions: bcmath, ctype, curl, fileinfo, json, mbstring, openssl, pdo_sqlite, tokenizer, xml, zip
+          coverage: none
+
+      - name: Install Laravel dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Run legacy password-provider compatibility test
+        env:
+          APP_ENV: testing
+          APP_KEY: base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          DB_CONNECTION: sqlite
+          DB_DATABASE: ':memory:'
+        run: vendor/bin/phpunit tests/Unit/LegacyPasswordUserProviderTest.php

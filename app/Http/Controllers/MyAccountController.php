@@ -57,6 +57,12 @@ class MyAccountController extends Controller
         $old_pass = $req->current_password;
         $new_pass = $req->password;
 
+        // A Supabase-managed profile has no Laravel password hash and should
+        // use Supabase password recovery/change instead.
+        if (!is_string($my_pass) || $my_pass === '') {
+            return back()->with('flash_danger', __('msg.p_reset_fail'));
+        }
+
         if(password_verify($old_pass, $my_pass)){
             $data['password'] = Hash::make($new_pass);
             $this->user->update($user_id, $data);
