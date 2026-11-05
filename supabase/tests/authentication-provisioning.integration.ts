@@ -380,7 +380,7 @@ Deno.test('real local Auth, provisioning authorization, tenant isolation, leases
     })
     assert(!!earlyCancel.error, 'cancellation proceeded while a worker held a live lease')
     const recoverable = await service.rpc('transition_provisioning_request', {
-      p_request_id: recoveryId, p_next_state: 'failed_recoverable', p_error_code: 'ci_recovery_test',
+      p_request_id: recoveryId, p_next_state: 'failed_recoverable', p_error_code: 'recovery_required',
       p_recovery_actor_auth_user_id: null, p_lease_token: recoveryLease,
     })
     assert(!recoverable.error, `recoverable transition failed: ${recoverable.error?.message ?? 'unknown'}`)
