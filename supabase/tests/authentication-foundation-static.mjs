@@ -5,6 +5,8 @@ import path from 'node:path'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const sql = readFileSync(path.join(root, 'supabase/migrations/20261105161648_authentication_foundation.sql'), 'utf8')
+// These checks validate SQL semantics, not the migration author's line wrapping.
+const sqlForAssertions = sql.replace(/\s+/g, ' ')
 const databaseTest = readFileSync(path.join(root, 'supabase/tests/authentication_foundation.sql'), 'utf8')
 
 function normalizeTypes(value) {
@@ -32,6 +34,7 @@ function normalizeTypes(value) {
 
 const declarations = new Map()
 const parameterNames = new Map()
+const parameterTypes = new Map()
 for (const match of sql.matchAll(/create\s+or\s+replace\s+function\s+([\w.]+)\s*\(([\s\S]*?)\)\s*returns/gi)) {
   const args = match[2].trim()
   const parts = args ? args.split(',').map(arg => arg.trim().split(/\s+/)) : []
@@ -41,8 +44,10 @@ for (const match of sql.matchAll(/create\s+or\s+replace\s+function\s+([\w.]+)\s*
     const modeOffset = ['in', 'out', 'inout', 'variadic'].includes(declaration[0].toLowerCase()) ? 1 : 0
     return declaration.slice(modeOffset + 1).join(' ')
   })
-  declarations.set(match[1].toLowerCase(), normalizeTypes(types.join(',')))
-  parameterNames.set(match[1].toLowerCase(), parts.map(arg => arg[0]))
+  const name = match[1].toLowerCase()
+  declarations.set(name, normalizeTypes(types.join(',')))
+  parameterNames.set(name, parts.map(arg => arg[0]))
+  parameterTypes.set(name, types.map(type => normalizeTypes(type)))
 }
 
 let privilegeStatements = 0
@@ -75,64 +80,70 @@ for (const match of databaseTest.matchAll(/has_function_privilege\(\s*'[^']+'\s*
   assert.equal(normalizeTypes(match[2]), declarations.get(name), `integration-test signature mismatch for ${name}`)
 }
 
-assert.match(sql, /create\s+unique\s+index\s+users_single_platform_owner[\s\S]*?where\s+user_type\s*=\s*'super_admin'/i)
-assert.match(sql, /pg_advisory_xact_lock\(7128649234::bigint\)/i)
-assert.match(sql, /p_actor_auth_user_id\s+uuid/i)
-assert.match(sql, /profile_has_permission\(actor_profile_id,\s*'platform\.schools\.manage'\)\s+is\s+not\s+true/i)
-assert.match(sql, /profile_has_permission\(actor_profile_id,\s*'school\.manage'\)\s+is\s+not\s+true/i)
+assert.match(sqlForAssertions, /create\s+unique\s+index\s+users_single_platform_owner[\s\S]*?where\s+user_type\s*=\s*'super_admin'/i)
+assert.match(sqlForAssertions, /pg_advisory_xact_lock\(7128649234::bigint\)/i)
+assert.match(sqlForAssertions, /p_actor_auth_user_id\s+uuid/i)
+assert.match(sqlForAssertions, /profile_has_permission\(actor_profile_id,\s*'platform\.schools\.manage'\)\s+is\s+not\s+true/i)
+assert.match(sqlForAssertions, /profile_has_permission\(actor_profile_id,\s*'school\.manage'\)\s+is\s+not\s+true/i)
 assert.equal((sql.match(/set_config\('request\.jwt\.claim\.sub',\s*p_actor_auth_user_id::text,\s*true\)/gi) ?? []).length, 2,
   'school provisioning audit writes must bind only the SQL-verified actor as a transaction-local JWT subject')
-assert.match(sql, /create\s+table\s+private\.provisioning_requests/i)
-assert.match(sql, /grant\s+select,\s*insert\s+on\s+public\.users,\s*public\.schools\s+to\s+service_role/i)
-assert.match(sql, /grant\s+select\s+on\s+auth\.users\s+to\s+service_role/i)
-assert.match(sql, /grant\s+insert\s+on\s+public\.staff_records\s+to\s+service_role/i)
-assert.match(sql, /grant\s+select,\s*insert\s+on\s+public\.audit_logs\s+to\s+service_role/i)
-assert.match(sql, /request_row\.payload_hash\s*<>\s*p_payload_hash[\s\S]*?request_row\.state\s+not\s+in\s*\('completed',\s*'failed_terminal'\)\s+and\s+request_row\.payload\s*<>\s*p_payload/i,
+assert.match(sqlForAssertions, /create\s+table\s+private\.provisioning_requests/i)
+assert.match(sqlForAssertions, /grant\s+select,\s*insert\s+on\s+public\.users,\s*public\.schools\s+to\s+service_role/i)
+assert.match(sqlForAssertions, /grant\s+select\s+on\s+auth\.users\s+to\s+service_role/i)
+assert.match(sqlForAssertions, /grant\s+insert\s+on\s+public\.staff_records\s+to\s+service_role/i)
+assert.match(sqlForAssertions, /grant\s+select,\s*insert\s+on\s+public\.audit_logs\s+to\s+service_role/i)
+assert.match(sqlForAssertions, /request_row\.payload_hash\s*<>\s*p_payload_hash[\s\S]*?request_row\.state\s+not\s+in\s*\('completed',\s*'failed_terminal'\)\s+and\s+request_row\.payload\s*<>\s*p_payload/i,
   'completed or terminal idempotency retries must compare the retained payload hash after clearing payload data')
-assert.match(sql, /state\s*=\s*case\s+when\s+auth_user_id\s+is\s+null\s+then\s+'pending'\s+else\s+'identity_created'\s+end/i,
+assert.match(sqlForAssertions, /state\s*=\s*case\s+when\s+auth_user_id\s+is\s+null\s+then\s+'pending'\s+else\s+'identity_created'\s+end/i,
   'recoverable requests with a linked Auth identity must resume at identity_created')
-assert.match(sql, /provisioning_payload_has_credentials\(payload\)/i)
-assert.match(sql, /jsonb_array_elements\(p_value\)/i)
-assert.match(sql, /state\s+in\s*\('pending',\s*'identity_created',\s*'profile_created',\s*'completed',\s*'failed_recoverable',\s*'failed_terminal',\s*'cancelling'\)/i)
-assert.match(sql, /request_row\.payload\s*<>\s*p_payload/i)
-assert.match(sql, /begin_provisioning_cancellation/i)
-assert.match(sql, /finish_provisioning_cancellation/i)
-assert.match(sql, /request_row\.state\s+not\s+in\s*\('failed_recoverable',\s*'failed_terminal',\s*'cancelling'\)/i)
-assert.match(sql, /recovery_channel\s*=\s*case\s+when\s+p_operator_auth_user_id\s+is\s+null\s+then\s+'bootstrap_operator'/i)
-assert.match(sql, /resume_owner_bootstrap_provisioning\(uuid\)/i)
-assert.match(sql, /grant\s+select,\s*insert,\s*update\s+on\s+private\.provisioning_requests\s+to\s+service_role/i)
-assert.match(sql, /raw_app_meta_data->>'nexasms_provisioning_request_id'\s*=\s*p_request_id::text/i)
-assert.doesNotMatch(sql, /raw_user_meta_data->>'nexasms_provisioning_request_id'/i)
-assert.match(sql, /create\s+table\s+private\.provisioning_identity_map/i)
-assert.match(sql, /provisioning_identity_map_active_email_uq/i)
-assert.match(sql, /create\s+or\s+replace\s+function\s+public\.begin_provisioning_identity_creation\(p_request_id uuid, p_lease_token uuid\)/i)
-assert.match(sql, /create\s+trigger\s+auth_users_bind_provisioning_identity[\s\S]*?before\s+insert\s+on\s+auth\.users/i)
-assert.match(sql, /new\.raw_app_meta_data\s*:=/i)
-assert.match(sql, /if\s+new\.invited_at\s+is\s+null\s+then\s+return\s+new/i,
+assert.match(sqlForAssertions, /provisioning_payload_has_credentials\(payload\)/i)
+assert.match(sqlForAssertions, /jsonb_array_elements\(p_value\)/i)
+assert.match(sqlForAssertions, /state\s+in\s*\('pending',\s*'identity_created',\s*'profile_created',\s*'completed',\s*'failed_recoverable',\s*'failed_terminal',\s*'cancelling'\)/i)
+assert.match(sqlForAssertions, /request_row\.payload\s*<>\s*p_payload/i)
+assert.match(sqlForAssertions, /begin_provisioning_cancellation/i)
+assert.match(sqlForAssertions, /finish_provisioning_cancellation/i)
+assert.match(sqlForAssertions, /request_row\.state\s+not\s+in\s*\('failed_recoverable',\s*'failed_terminal',\s*'cancelling'\)/i)
+assert.match(sqlForAssertions, /recovery_channel\s*=\s*case\s+when\s+p_operator_auth_user_id\s+is\s+null\s+then\s+'bootstrap_operator'/i)
+assert.match(sqlForAssertions, /resume_owner_bootstrap_provisioning\(uuid\)/i)
+assert.match(sqlForAssertions, /grant\s+select,\s*insert,\s*update\s+on\s+private\.provisioning_requests\s+to\s+service_role/i)
+assert.match(sqlForAssertions, /raw_app_meta_data->>'nexasms_provisioning_request_id'\s*=\s*p_request_id::text/i)
+assert.doesNotMatch(sqlForAssertions, /raw_user_meta_data->>'nexasms_provisioning_request_id'/i)
+assert.match(sqlForAssertions, /create\s+table\s+private\.provisioning_identity_map/i)
+assert.match(sqlForAssertions, /provisioning_identity_map_active_email_uq/i)
+assert.match(sqlForAssertions, /create\s+or\s+replace\s+function\s+public\.begin_provisioning_identity_creation\s*\(\s*p_request_id\s+uuid\s*,\s*p_lease_token\s+uuid\s*\)/i)
+assert.match(sqlForAssertions, /create\s+trigger\s+auth_users_bind_provisioning_identity[\s\S]*?before\s+insert\s+on\s+auth\.users/i)
+assert.match(sqlForAssertions, /new\.raw_app_meta_data\s*:=/i)
+assert.match(sqlForAssertions, /if\s+new\.invited_at\s+is\s+null\s+then\s+return\s+new/i,
   'ordinary signups or unrelated Auth Admin creates must not consume an invite intent')
-assert.match(sql, /create\s+or\s+replace\s+function\s+public\.reserve_owner_bootstrap_request\(p_request_id uuid, p_payload jsonb, p_payload_hash text, p_token_hash text, p_source_hash text\)/i)
-assert.match(sql, /p_payload->>'email'\s+is\s+null\s+or\s+p_payload->>'name'\s+is\s+null/i,
+assert.match(sqlForAssertions, /create\s+or\s+replace\s+function\s+public\.reserve_owner_bootstrap_request\s*\(\s*p_request_id\s+uuid\s*,\s*p_payload\s+jsonb\s*,\s*p_payload_hash\s+text\s*,\s*p_token_hash\s+text\s*,\s*p_source_hash\s+text\s*\)/i)
+assert.deepEqual(parameterNames.get('public.reserve_owner_bootstrap_request'), [
+  'p_request_id', 'p_payload', 'p_payload_hash', 'p_token_hash', 'p_source_hash',
+], 'owner bootstrap parameter names and order must match the migration contract')
+assert.deepEqual(parameterTypes.get('public.reserve_owner_bootstrap_request'), [
+  'uuid', 'jsonb', 'text', 'text', 'text',
+], 'owner bootstrap parameter types and order must match the migration contract')
+assert.match(sqlForAssertions, /p_payload->>'email'\s+is\s+null\s+or\s+p_payload->>'name'\s+is\s+null/i,
   'database bootstrap input validation must explicitly reject missing required values')
-assert.match(sql, /consumed_request_id\s+<>\s+p_request_id[\s\S]*?bootstrap_replayed/i)
-assert.match(sql, /owner bootstrap credential was not atomically consumed for this request/i)
-assert.match(sql, /private\.arm_owner_bootstrap_credential\(text, timestamptz\) owner to postgres/i)
-assert.match(sql, /create\s+or\s+replace\s+function\s+public\.consume_owner_bootstrap_rate_limit\(p_source_hash text\)/i)
-assert.match(sql, /create\s+table\s+private\.owner_bootstrap_security_events/i)
-assert.match(sql, /lookup_provisioning_identity/i)
-assert.match(sql, /resume_owner_bootstrap_provisioning/i)
-assert.match(sql, /create\s+or\s+replace\s+function\s+public\.claim_provisioning_request\(p_request_id uuid, p_lease_token uuid\)/i)
-assert.match(sql, /create\s+or\s+replace\s+function\s+public\.renew_provisioning_lease\(p_request_id uuid, p_lease_token uuid\)/i)
-assert.match(sql, /lease_expires_at\s*=\s*clock_timestamp\(\)\s*\+\s*interval\s+'10 minutes'/i)
-assert.match(sql, /request_row\.lease_token\s+is\s+distinct\s+from\s+p_lease_token/i)
-assert.match(sql, /request_row\.lease_expires_at\s*<=\s*clock_timestamp\(\)/i)
-assert.match(sql, /alter\s+function\s+public\.renew_provisioning_lease\(uuid,\s*uuid\)\s+owner\s+to\s+postgres/i)
-assert.match(sql, /revoke\s+all\s+on\s+function\s+public\.renew_provisioning_lease\(uuid,\s*uuid\)\s+from\s+public,\s*anon,\s*authenticated/i)
-assert.match(sql, /grant\s+execute\s+on\s+function\s+public\.renew_provisioning_lease\(uuid,\s*uuid\)\s+to\s+service_role/i)
-assert.match(sql, /create\s+or\s+replace\s+function\s+public\.transition_provisioning_request\([\s\S]*?p_lease_token uuid default null/i)
-assert.match(sql, /request_row\.state\s+not\s+in\s*\('identity_created',\s*'profile_created'\)/i)
-assert.match(sql, /create\s+or\s+replace\s+function\s+public\.record_provisioning_identity\(p_request_id uuid, p_auth_user_id uuid, p_lease_token uuid\)/i)
-assert.match(sql, /constraint\s+provisioning_requests_lease_pair/i)
-assert.match(sql, /request_row\.state\s+not\s+in\s*\('pending',\s*'identity_created',\s*'profile_created'\)/i)
+assert.match(sqlForAssertions, /consumed_request_id\s+<>\s+p_request_id[\s\S]*?bootstrap_replayed/i)
+assert.match(sqlForAssertions, /owner bootstrap credential was not atomically consumed for this request/i)
+assert.match(sqlForAssertions, /private\.arm_owner_bootstrap_credential\(text, timestamptz\) owner to postgres/i)
+assert.match(sqlForAssertions, /create\s+or\s+replace\s+function\s+public\.consume_owner_bootstrap_rate_limit\(p_source_hash text\)/i)
+assert.match(sqlForAssertions, /create\s+table\s+private\.owner_bootstrap_security_events/i)
+assert.match(sqlForAssertions, /lookup_provisioning_identity/i)
+assert.match(sqlForAssertions, /resume_owner_bootstrap_provisioning/i)
+assert.match(sqlForAssertions, /create\s+or\s+replace\s+function\s+public\.claim_provisioning_request\s*\(\s*p_request_id\s+uuid\s*,\s*p_lease_token\s+uuid\s*\)/i)
+assert.match(sqlForAssertions, /create\s+or\s+replace\s+function\s+public\.renew_provisioning_lease\s*\(\s*p_request_id\s+uuid\s*,\s*p_lease_token\s+uuid\s*\)/i)
+assert.match(sqlForAssertions, /lease_expires_at\s*=\s*clock_timestamp\(\)\s*\+\s*interval\s+'10 minutes'/i)
+assert.match(sqlForAssertions, /request_row\.lease_token\s+is\s+distinct\s+from\s+p_lease_token/i)
+assert.match(sqlForAssertions, /request_row\.lease_expires_at\s*<=\s*clock_timestamp\(\)/i)
+assert.match(sqlForAssertions, /alter\s+function\s+public\.renew_provisioning_lease\s*\(\s*uuid\s*,\s*uuid\s*\)\s+owner\s+to\s+postgres/i)
+assert.match(sqlForAssertions, /revoke\s+all\s+on\s+function\s+public\.renew_provisioning_lease\s*\(\s*uuid\s*,\s*uuid\s*\)\s+from\s+public,\s*anon,\s*authenticated/i)
+assert.match(sqlForAssertions, /grant\s+execute\s+on\s+function\s+public\.renew_provisioning_lease\s*\(\s*uuid\s*,\s*uuid\s*\)\s+to\s+service_role/i)
+assert.match(sqlForAssertions, /create\s+or\s+replace\s+function\s+public\.transition_provisioning_request\s*\([\s\S]*?p_lease_token\s+uuid\s+default\s+null/i)
+assert.match(sqlForAssertions, /request_row\.state\s+not\s+in\s*\('identity_created',\s*'profile_created'\)/i)
+assert.match(sqlForAssertions, /create\s+or\s+replace\s+function\s+public\.record_provisioning_identity\s*\(\s*p_request_id\s+uuid\s*,\s*p_auth_user_id\s+uuid\s*,\s*p_lease_token\s+uuid\s*\)/i)
+assert.match(sqlForAssertions, /constraint\s+provisioning_requests_lease_pair/i)
+assert.match(sqlForAssertions, /request_row\.state\s+not\s+in\s*\('pending',\s*'identity_created',\s*'profile_created'\)/i)
 assert.deepEqual(parameterNames.get('public.provision_school_and_first_admin'), [
   'p_request_id', 'p_auth_user_id', 'p_actor_auth_user_id', 'p_school_name', 'p_school_code', 'p_registration_number',
   'p_school_email', 'p_phone', 'p_address', 'p_timezone', 'p_currency', 'p_status', 'p_admin_name', 'p_lease_token',
