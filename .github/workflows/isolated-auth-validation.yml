@@ -67,7 +67,7 @@ jobs:
           psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/authentication_foundation.sql
 
       - name: Run mocked provisioning recovery tests
-        run: deno test --allow-env --allow-net supabase/tests/provisioning-recovery.test.ts
+        run: deno test --node-modules-dir=auto --allow-env --allow-net supabase/tests/provisioning-recovery.test.ts
 
       - name: Start local Edge Functions with disposable generated secrets
         shell: bash
@@ -103,10 +103,10 @@ jobs:
           exit 1
 
       - name: Type-check Edge Functions and integration suite
-        run: deno check supabase/functions/*/index.ts supabase/tests/authentication-provisioning.integration.ts
+        run: deno check --node-modules-dir=auto supabase/functions/*/index.ts supabase/tests/authentication-provisioning.integration.ts
 
       - name: Exercise real local Auth, SQL RPCs, tenant reads, and recovery transitions
-        run: deno test --allow-env --allow-net --allow-run=psql supabase/tests/authentication-provisioning.integration.ts
+        run: deno test --node-modules-dir=auto --allow-env --allow-net --allow-run=psql supabase/tests/authentication-provisioning.integration.ts
 
       - name: Stop disposable Supabase stack
         if: always()

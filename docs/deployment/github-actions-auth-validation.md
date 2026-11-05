@@ -25,7 +25,7 @@ The first published run was `42103654559` on commit `a44b07d486577cd938214f2f915
 
 The same first run's Laravel job failed during Composer's `post-autoload-dump` package discovery because Laravel's writable framework/cache directories are intentionally absent from a clean checkout. The workflow now creates those disposable runner directories before installing dependencies. These CI corrections do not touch the hosted Supabase project or modify the Laravel application.
 
-The corrected workflow will be pushed as a follow-up commit. Its actual result will be recorded below after completion; until then no SQL, Deno, Auth/JWT, concurrency, RLS, or PHPUnit checks are claimed passed.
+Run `42104637750` validated the reconciled migration chain in the isolated Supabase stack and passed the static function-signature scan and PostgreSQL catalog assertions. The mocked Deno recovery test then failed before executing because Deno did not have the pinned npm package in a local `node_modules` directory. Edge Function type-checking, the real local Auth/Postgres integration suite, and subsequent assertions were skipped. The Laravel password compatibility job completed successfully. The workflow now opts into Deno's automatic node_modules mode for the Deno check/test commands; the follow-up run result is recorded below after completion.
 
 After it runs, inspect any failures before treating the migration as approved. Some fault modes cannot be induced reliably in the real local stack (network timeout after Auth write, failed Auth compensation, lost PostgREST response, and exact lease-expiry race); the existing fake-service suite covers modeled variants only. The runtime suite currently verifies live lease renewal and competing claims, but does not wait ten minutes to test a real database lease expiration/reclaim. A real concurrent owner wave tests the database-level single-owner lock/index; school and staff provisioning are performed for separate tenants and tenant reads are checked under real Auth JWTs.
 
@@ -51,11 +51,13 @@ No `supabase link`, `supabase db push`, hosted migration, Edge Function deployme
 
 The workflow listens for pushes and pull requests targeting `deployment/vercel-supabase-poc`, plus manual dispatch. Review every failing log and resulting diff; do not apply the rejected migration to the existing hosted project based only on a passing isolated run. An independent security review and explicit production approval remain required before hosted SQL or function deployment.
 
-## First-run diagnosis and correction
+## Runtime run history
 
 Run `42103654559` failed in both jobs before test execution:
 
 - Supabase local startup stopped at `20261104164653_nexasms_initial_schema_20261104.sql`, statement 3, with PostgreSQL `42P07: relation "blood_groups" already exists`. The earlier proposal-only draft was incorrectly inside the active migrations directory and had already created the table. The exact draft remains preserved in `supabase/proposals/` and is excluded from the active migration chain.
 - Laravel Composer dependency installation stopped in `artisan package:discover` with `InvalidArgumentException: Please provide a valid cache path.` A clean checkout does not contain generated `storage/framework/*` or `bootstrap/cache` directories. The workflow creates these directories on the ephemeral runner before Composer runs.
 
-No integration test results came from that run: SQL catalog tests, Deno tests, Auth/RLS integration checks, and PHPUnit were skipped after setup failures. The corrected follow-up workflow run is pending/result not yet recorded.
+No integration test results came from run `42103654559`: SQL catalog tests, Deno tests, Auth/RLS integration checks, and PHPUnit were skipped after setup failures.
+
+Run `42104637750` on commit `8cf4834f6b447c3ee91b4d9b991e6949bdff8d73` confirmed that the migration-chain cleanup worked: the disposable Supabase stack started, all active migrations applied, the static signature scan passed, and the PostgreSQL catalog assertions passed. The mocked recovery step failed at dependency resolution with `Could not find a matching package for 'npm:@supabase/supabase-js@2.119.0' in the node_modules directory`; it did not execute the test cases. Deno check and real Auth/Postgres integration were skipped. The separate Laravel password-provider compatibility job passed. The workflow now sets `--node-modules-dir=auto` on Deno test and check commands, following Deno's documented npm package installation mode. A follow-up run is pending/result not yet recorded.
