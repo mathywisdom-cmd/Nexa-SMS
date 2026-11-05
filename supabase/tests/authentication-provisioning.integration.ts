@@ -200,7 +200,13 @@ Deno.test('real local Auth, provisioning authorization, tenant isolation, leases
       p_request_id: owner.id, p_auth_user_id: owner.authId, p_name: owner.name, p_lease_token: owner.lease,
     })))
     const successfulOwners = ownerAttempts.filter(result => result.status === 'fulfilled' && !result.value.error)
-    assert(successfulOwners.length === 1, `expected exactly one concurrent owner bootstrap winner; got ${successfulOwners.length}`)
+    const ownerFailureDetails = ownerAttempts.map((result, index) => {
+      if (result.status === 'rejected') return `owner${index}: ${String(result.reason?.message ?? 'request rejected')}`
+      if (result.value.error) return `owner${index}: ${result.value.error.code ?? 'database_error'} ${result.value.error.message ?? 'no message'}`
+      return `owner${index}: succeeded`
+    })
+    assert(successfulOwners.length === 1,
+      `expected exactly one concurrent owner bootstrap winner; got ${successfulOwners.length}; ${ownerFailureDetails.join('; ')}`)
     const ownerIndex = ownerAttempts.findIndex(result => result.status === 'fulfilled' && !result.value.error)
     const owner = owners[ownerIndex]
     const ownerCount = await service.from('users').select('id', { count: 'exact', head: true }).eq('user_type', 'super_admin')
