@@ -22,13 +22,28 @@ for (const match of sql.matchAll(/create\s+or\s+replace\s+function\s+([\w.]+)\s*
 }
 
 let privilegeStatements = 0
+const ownershipStatements = new Set()
+const revokeStatements = new Set()
+const grantStatements = new Set()
 for (const match of sql.matchAll(/(?:alter\s+function|revoke\s+all\s+on\s+function|grant\s+execute\s+on\s+function)\s+([\w.]+)\s*\(([^)]*)\)/gi)) {
   const name = match[1].toLowerCase()
   assert.ok(declarations.has(name), `privilege/ownership statement references undeclared function ${name}`)
   assert.equal(normalizeTypes(match[2]), declarations.get(name), `argument signature mismatch for ${name}`)
   privilegeStatements++
+  const statement = match[0].toLowerCase()
+  if (statement.startsWith('alter function')) ownershipStatements.add(name)
+  if (statement.startsWith('revoke all')) revokeStatements.add(name)
+  if (statement.startsWith('grant execute')) grantStatements.add(name)
 }
-assert.ok(privilegeStatements >= declarations.size * 3, 'every declared function must have ownership, revoke, and grant statements')
+for (const name of declarations.keys()) {
+  assert.ok(ownershipStatements.has(name), `missing explicit owner statement for ${name}`)
+  assert.ok(revokeStatements.has(name), `missing explicit revoke statement for ${name}`)
+  if (['private.arm_owner_bootstrap_credential', 'private.bind_provisioning_auth_identity'].includes(name)) {
+    assert.ok(!grantStatements.has(name), `${name} must remain owner/trigger-only`)
+  } else {
+    assert.ok(grantStatements.has(name), `missing explicit execution grant for ${name}`)
+  }
+}
 
 for (const match of databaseTest.matchAll(/has_function_privilege\(\s*'[^']+'\s*,\s*'([\w.]+)\(([^)]*)\)'/gi)) {
   const name = match[1].toLowerCase()
@@ -62,7 +77,23 @@ assert.match(sql, /request_row\.state\s+not\s+in\s*\('failed_recoverable',\s*'fa
 assert.match(sql, /recovery_channel\s*=\s*case\s+when\s+p_operator_auth_user_id\s+is\s+null\s+then\s+'bootstrap_operator'/i)
 assert.match(sql, /resume_owner_bootstrap_provisioning\(uuid\)/i)
 assert.match(sql, /grant\s+select,\s*insert,\s*update\s+on\s+private\.provisioning_requests\s+to\s+service_role/i)
-assert.match(sql, /raw_user_meta_data->>'nexasms_provisioning_request_id'\s*=\s*p_request_id::text/i)
+assert.match(sql, /raw_app_meta_data->>'nexasms_provisioning_request_id'\s*=\s*p_request_id::text/i)
+assert.doesNotMatch(sql, /raw_user_meta_data->>'nexasms_provisioning_request_id'/i)
+assert.match(sql, /create\s+table\s+private\.provisioning_identity_map/i)
+assert.match(sql, /provisioning_identity_map_active_email_uq/i)
+assert.match(sql, /create\s+or\s+replace\s+function\s+public\.begin_provisioning_identity_creation\(p_request_id uuid, p_lease_token uuid\)/i)
+assert.match(sql, /create\s+trigger\s+auth_users_bind_provisioning_identity[\s\S]*?before\s+insert\s+on\s+auth\.users/i)
+assert.match(sql, /new\.raw_app_meta_data\s*:=/i)
+assert.match(sql, /if\s+new\.invited_at\s+is\s+null\s+then\s+return\s+new/i,
+  'ordinary signups or unrelated Auth Admin creates must not consume an invite intent')
+assert.match(sql, /create\s+or\s+replace\s+function\s+public\.reserve_owner_bootstrap_request\(p_request_id uuid, p_payload jsonb, p_payload_hash text, p_token_hash text, p_source_hash text\)/i)
+assert.match(sql, /p_payload->>'email'\s+is\s+null\s+or\s+p_payload->>'name'\s+is\s+null/i,
+  'database bootstrap input validation must explicitly reject missing required values')
+assert.match(sql, /consumed_request_id\s+<>\s+p_request_id[\s\S]*?bootstrap_replayed/i)
+assert.match(sql, /owner bootstrap credential was not atomically consumed for this request/i)
+assert.match(sql, /private\.arm_owner_bootstrap_credential\(text, timestamptz\) owner to postgres/i)
+assert.match(sql, /create\s+or\s+replace\s+function\s+public\.consume_owner_bootstrap_rate_limit\(p_source_hash text\)/i)
+assert.match(sql, /create\s+table\s+private\.owner_bootstrap_security_events/i)
 assert.match(sql, /lookup_provisioning_identity/i)
 assert.match(sql, /resume_owner_bootstrap_provisioning/i)
 assert.match(sql, /create\s+or\s+replace\s+function\s+public\.claim_provisioning_request\(p_request_id uuid, p_lease_token uuid\)/i)
@@ -111,11 +142,24 @@ assert.match(recovery, /NEXASMS_PROVISIONING_OPERATOR_TOKEN/)
 assert.match(recovery, /request\.operation !== 'owner_bootstrap'/)
 assert.match(recovery, /resume_owner_bootstrap_provisioning/)
 assert.doesNotMatch(recovery, /Deno\.env\.get\(['"]SUPABASE_SERVICE_ROLE_KEY['"]\)/)
+assert.match(login, /readJsonObject\(req,\s*4\s*\*\s*1024\)/)
+assert.match(readFileSync(path.join(root, 'supabase/functions/bootstrap-owner/index.ts'), 'utf8'), /readJsonObject\(req,\s*8\s*\*\s*1024\)/)
+assert.match(readFileSync(path.join(root, 'supabase/functions/provision-school/index.ts'), 'utf8'), /readJsonObject\(req,\s*16\s*\*\s*1024\)/)
+assert.match(readFileSync(path.join(root, 'supabase/functions/provision-school-user/index.ts'), 'utf8'), /readJsonObject\(req,\s*12\s*\*\s*1024\)/)
+assert.match(recovery, /readJsonObject\(req,\s*4\s*\*\s*1024\)/)
+const bodyReader = readFileSync(path.join(root, 'supabase/functions/_shared/http.ts'), 'utf8')
+assert.match(bodyReader, /Content-Length as the only limit/)
+assert.match(bodyReader, /size > maxBytes/)
+assert.match(bodyReader, /reader\.cancel\(\)/)
+const bodyTests = readFileSync(path.join(root, 'supabase/tests/request-body.test.ts'), 'utf8')
+for (const scenario of ['oversized declared content', 'oversized streamed content', 'malformed, empty, and missing bodies']) {
+  assert.ok(bodyTests.includes(scenario), `missing bounded-body test scenario: ${scenario}`)
+}
 const cancellation = readFileSync(path.join(root, 'supabase/functions/_shared/recovery.ts'), 'utf8')
 assert.match(cancellation, /begin_provisioning_cancellation/)
 assert.match(cancellation, /finish_provisioning_cancellation/)
 assert.match(cancellation, /getUserById\(authUserId\)/)
-assert.match(cancellation, /nexasms_provisioning_request_id/)
+assert.match(cancellation, /identity_email/)
 assert.match(readFileSync(path.join(root, 'supabase/config.toml'), 'utf8'), /\[functions\.provisioning-recovery\][\s\S]*?verify_jwt\s*=\s*false/i)
 for (const functionPath of ['bootstrap-owner/index.ts', 'provision-school/index.ts', 'provision-school-user/index.ts']) {
   const source = readFileSync(path.join(root, 'supabase/functions', functionPath), 'utf8')
@@ -124,7 +168,7 @@ for (const functionPath of ['bootstrap-owner/index.ts', 'provision-school/index.
 const recoveryTests = readFileSync(path.join(root, 'supabase/tests/provisioning-recovery.test.ts'), 'utf8')
 for (const scenario of [
   'invite failure remains retryable',
-  'invite created identity but lost response',
+  'invite created identity but lost response reconciles after user metadata mutation',
   'profile insertion failure resumes',
   'committed SQL transaction with lost response',
   'same idempotency key is reused',
@@ -134,6 +178,7 @@ for (const scenario of [
   'failed Auth compensation',
   'cancellation retry reconciles Auth deletion after response loss',
   'orphan Auth identity lookup',
+  'missing server-controlled Auth marker is rejected',
   'lease renewal extends the live lease',
   'expired lease cannot be renewed',
   'competing worker cannot renew or claim',
@@ -141,6 +186,9 @@ for (const scenario of [
   'lease renewal rejects cancellation and terminal states',
   'renewal failure stops provisioning',
 ]) assert.ok(recoveryTests.includes(scenario), `missing provisioning recovery test: ${scenario}`)
+const operatorTokenTests = readFileSync(path.join(root, 'supabase/tests/operator-token.test.ts'), 'utf8')
+assert.match(operatorTokenTests, /unexpired configured deadline/)
+assert.match(operatorTokenTests, /rotating an operator token invalidates the old value/)
 const integrationTests = readFileSync(path.join(root, 'supabase/tests/authentication-provisioning.integration.ts'), 'utf8')
 assert.match(integrationTests, /resumedRetry\.state\s*===\s*'identity_created'[\s\S]*?resumedRetry\.auth_user_id\s*===\s*retryAuthId/,
   'PostgreSQL/Auth integration suite must verify that a linked identity retry resumes at identity_created')

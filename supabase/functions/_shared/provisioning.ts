@@ -1,10 +1,12 @@
 import type { SupabaseClient } from 'npm:@supabase/supabase-js@2.119.0'
 import {
   changeProvisioningState,
+  beginProvisioningIdentityCreation,
   inviteIdentity,
   ledgerErrorCode,
   ProvisioningError,
   readProvisioningRequest,
+  provisioningIdentity,
   type ProvisioningRequest,
 } from './http.ts'
 
@@ -85,8 +87,8 @@ async function ensureIdentity(
     lease.assertOwned()
     if (error && error.status !== 404) throw new ProvisioningError('auth_lookup_failed')
     if (data.user) {
-      if (data.user.email?.toLowerCase() !== email
-        || data.user.user_metadata?.nexasms_provisioning_request_id !== request.request_id) {
+      const bound = await provisioningIdentity(service, request.request_id, email)
+      if (data.user.email?.toLowerCase() !== email || bound?.id !== authUserId) {
         throw new ProvisioningError('identity_marker_mismatch', true)
       }
       return authUserId
@@ -97,9 +99,15 @@ async function ensureIdentity(
     authUserId = null
   }
 
-  const user = await inviteIdentity(service, email, request.request_id)
+  const alreadyBound = await provisioningIdentity(service, request.request_id, email)
+  if (alreadyBound) authUserId = alreadyBound.id
+  if (!authUserId) await beginProvisioningIdentityCreation(service, request.request_id, leaseToken)
   lease.assertOwned()
-  authUserId = user.id
+  if (!authUserId) {
+    const user = await inviteIdentity(service, email, request.request_id)
+    lease.assertOwned()
+    authUserId = user.id
+  }
   const { error } = await service.rpc('record_provisioning_identity', {
     p_request_id: request.request_id,
     p_auth_user_id: authUserId,

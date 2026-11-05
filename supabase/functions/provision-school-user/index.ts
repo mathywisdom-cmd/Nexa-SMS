@@ -1,4 +1,4 @@
-import { authenticateCaller, corsHeaders, hasPermission, jsonResponse, profileFrom, reserveProvisioningRequest, validRequestId, ProvisioningError } from '../_shared/http.ts'
+import { authenticateCaller, corsHeaders, hasPermission, jsonResponse, profileFrom, readJsonObject, requestBodyErrorResponse, reserveProvisioningRequest, validRequestId, ProvisioningError } from '../_shared/http.ts'
 import { runProvisioningRequest, safeProvisioningResponse } from '../_shared/provisioning.ts'
 
 const allowedSchoolTypes = new Set(['teacher', 'accountant', 'librarian', 'student', 'parent'])
@@ -16,7 +16,7 @@ Deno.serve(async req => {
       return jsonResponse({ error: 'forbidden' }, 403, req)
     }
 
-    const input = await req.json() as Record<string, unknown>
+    const input = await readJsonObject(req, 12 * 1024)
     const stringValue = (key: string, max: number) => typeof input[key] === 'string' && (input[key] as string).trim().length <= max ? (input[key] as string).trim() : ''
     const name = stringValue('name', 150)
     const email = stringValue('email', 100).toLowerCase()
@@ -49,6 +49,8 @@ Deno.serve(async req => {
     const result = await runProvisioningRequest(service, request)
     return jsonResponse(safeProvisioningResponse(requestId, result), 200, req)
   } catch (error) {
+    const bodyError = requestBodyErrorResponse(error, req)
+    if (bodyError) return bodyError
     console.error('School-user provisioning request failed', error instanceof ProvisioningError ? error.code : 'unknown')
     const message = error instanceof Error ? error.message : ''
     return jsonResponse({ error: message === 'unauthorized' ? 'unauthorized' : message === 'unprovisioned' ? 'unprovisioned' : 'provisioning_incomplete', request_id: requestId, recovery_required: !!requestId }, message === 'unauthorized' ? 401 : message === 'unprovisioned' ? 403 : 503, req)

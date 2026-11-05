@@ -25,6 +25,67 @@ export function jsonResponse(body: unknown, status = 200, req?: Request): Respon
   })
 }
 
+export class RequestBodyError extends Error {
+  constructor(public code: 'payload_too_large' | 'missing_body' | 'invalid_content_type' | 'invalid_json' | 'invalid_body', public status: 400 | 413) {
+    super(code)
+  }
+}
+
+/** Read bounded JSON without trusting Content-Length as the only limit. */
+export async function readJsonObject(req: Request, maxBytes: number): Promise<Record<string, unknown>> {
+  if (!/^application\/json(?:\s*;|$)/i.test(req.headers.get('content-type') ?? '')) {
+    throw new RequestBodyError('invalid_content_type', 400)
+  }
+  const declaredLength = req.headers.get('content-length')
+  if (declaredLength && /^\d+$/.test(declaredLength) && Number(declaredLength) > maxBytes) {
+    await req.body?.cancel().catch(() => undefined)
+    throw new RequestBodyError('payload_too_large', 413)
+  }
+  if (!req.body) throw new RequestBodyError('missing_body', 400)
+
+  const reader = req.body.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      size += value.byteLength
+      if (size > maxBytes) {
+        await reader.cancel().catch(() => undefined)
+        throw new RequestBodyError('payload_too_large', 413)
+      }
+      chunks.push(value)
+    }
+  } catch (error) {
+    if (error instanceof RequestBodyError) throw error
+    throw new RequestBodyError('invalid_body', 400)
+  } finally {
+    reader.releaseLock()
+  }
+  if (size === 0) throw new RequestBodyError('missing_body', 400)
+
+  const bytes = new Uint8Array(size)
+  let offset = 0
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
+  let value: unknown
+  try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) } catch {
+    throw new RequestBodyError('invalid_json', 400)
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new RequestBodyError('invalid_body', 400)
+  return value as Record<string, unknown>
+}
+
+export function requestBodyErrorResponse(error: unknown, req: Request): Response | null {
+  if (!(error instanceof RequestBodyError)) return null
+  return jsonResponse({ error: error.code }, error.status, req)
+}
+
+export async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('')
+}
+
 export function getClients() {
   const url = Deno.env.get('SUPABASE_URL')
   const anon = Deno.env.get('SUPABASE_ANON_KEY')
@@ -143,6 +204,34 @@ export async function reserveProvisioningRequest(
   return { ...data, operation, actor_auth_user_id: actorAuthUserId, payload, payload_hash: payloadHash } as ProvisioningRequest
 }
 
+export async function consumeOwnerBootstrapRateLimit(service: SupabaseClient, sourceHash: string): Promise<boolean> {
+  const { data, error } = await service.rpc('consume_owner_bootstrap_rate_limit', { p_source_hash: sourceHash })
+  if (error || typeof data !== 'boolean') throw new ProvisioningError('bootstrap_rate_limit_unavailable')
+  return data
+}
+
+export async function reserveOwnerBootstrapRequest(
+  service: SupabaseClient,
+  requestId: string,
+  payload: Record<string, unknown>,
+  tokenHash: string,
+  sourceHash: string,
+): Promise<ProvisioningRequest> {
+  const payloadHash = await hashProvisioningPayload(payload)
+  const { data, error } = await service.rpc('reserve_owner_bootstrap_request', {
+    p_request_id: requestId,
+    p_payload: payload,
+    p_payload_hash: payloadHash,
+    p_token_hash: tokenHash,
+    p_source_hash: sourceHash,
+  })
+  if (error || !data || data.ok !== true || !data.request) {
+    const code = typeof data?.code === 'string' ? data.code : 'bootstrap_unavailable'
+    throw new ProvisioningError(code, ['owner_already_exists', 'request_conflict', 'bootstrap_replayed', 'bootstrap_expired', 'not_authorized'].includes(code))
+  }
+  return { ...data.request, operation: 'owner_bootstrap', actor_auth_user_id: null, payload, payload_hash: payloadHash } as ProvisioningRequest
+}
+
 export async function readProvisioningRequest(service: SupabaseClient, requestId: string): Promise<ProvisioningRequest | null> {
   const { data, error } = await service.rpc('get_provisioning_request', { p_request_id: requestId })
   if (error) throw new ProvisioningError('recovery_unavailable')
@@ -168,17 +257,7 @@ export async function changeProvisioningState(
   return data as Record<string, unknown>
 }
 
-export async function inviteIdentity(service: SupabaseClient, email: string, requestId: string) {
-  // The user-metadata marker is correlation data only. It is never used for
-  // authorization; SQL actor/permission checks remain authoritative.
-  const { data, error } = await service.auth.admin.inviteUserByEmail(email, {
-    data: { nexasms_provisioning_request_id: requestId },
-  })
-  if (!error && data.user) return data.user
-
-  // HTTP failure can follow a successful Auth write. Resolve by exact email
-  // and immutable request correlation in the private database, not by scanning
-  // or exposing the Auth user directory.
+export async function provisioningIdentity(service: SupabaseClient, requestId: string, email: string) {
   const { data: lookup, error: lookupError } = await service.rpc('lookup_provisioning_identity', {
     p_request_id: requestId,
   })
@@ -187,14 +266,39 @@ export async function inviteIdentity(service: SupabaseClient, email: string, req
   if (recoveredId) {
     const { data: recovered, error: recoveredError } = await service.auth.admin.getUserById(recoveredId)
     if (recoveredError || !recovered.user
-      || recovered.user.email?.toLowerCase() !== email.toLowerCase()
-      || recovered.user.user_metadata?.nexasms_provisioning_request_id !== requestId) {
+      || recovered.user.email?.toLowerCase() !== email.toLowerCase()) {
       throw new ProvisioningError('auth_lookup_failed')
     }
     return recovered.user
   }
   if (lookup.email_occupied === true) throw new ProvisioningError('identity_conflict', true)
+  return null
+}
+
+export async function inviteIdentity(service: SupabaseClient, email: string, requestId: string) {
+  // A before-insert Auth trigger atomically binds this invite to the reserved
+  // server-side intent. User-editable metadata is deliberately not involved.
+  const { data, error } = await service.auth.admin.inviteUserByEmail(email)
+  if (!error && data.user) {
+    const bound = await provisioningIdentity(service, requestId, email)
+    if (!bound || bound.id !== data.user.id) throw new ProvisioningError('identity_correlation_failed', true)
+    return bound
+  }
+
+  // A request timeout may follow a committed Auth insert. Only the private
+  // database mapping can reconcile it; an occupied email without that mapping
+  // is a conflict and must never be adopted.
+  const recovered = await provisioningIdentity(service, requestId, email)
+  if (recovered) return recovered
   throw new ProvisioningError('auth_invite_failed')
+}
+
+export async function beginProvisioningIdentityCreation(service: SupabaseClient, requestId: string, leaseToken: string) {
+  const { error } = await service.rpc('begin_provisioning_identity_creation', {
+    p_request_id: requestId,
+    p_lease_token: leaseToken,
+  })
+  if (error) throw new ProvisioningError('identity_intent_failed')
 }
 
 export async function removeIdentity(service: SupabaseClient, userId: string) {

@@ -13,16 +13,18 @@ export async function cancelProvisioningRequest(
   if (beginError || !cancellation) throw new ProvisioningError('request_not_cancellable', true)
 
   const authUserId = cancellation.auth_user_id as string | null
+  const expectedEmail = typeof cancellation.identity_email === 'string' ? cancellation.identity_email.toLowerCase() : null
   let deletionConfirmed = !authUserId
   if (authUserId) {
     const { data: authResult, error: lookupError } = await service.auth.admin.getUserById(authUserId)
     const authUser = authResult?.user
-    const isRequestIdentity = authUser?.user_metadata?.nexasms_provisioning_request_id === requestId
     if (!authUser && lookupError?.status === 404) {
       deletionConfirmed = true
     } else if (lookupError) {
       deletionConfirmed = false
-    } else if (isRequestIdentity) {
+    } else if (expectedEmail && authUser?.email?.toLowerCase() === expectedEmail) {
+      // SQL returned this UUID from the immutable private request-to-Auth map.
+      // Never infer identity ownership from user-editable Auth metadata.
       try {
         await removeIdentity(service, authUserId)
         deletionConfirmed = true

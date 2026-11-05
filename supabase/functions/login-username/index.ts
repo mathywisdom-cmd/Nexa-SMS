@@ -1,4 +1,4 @@
-import { corsHeaders, getClients, jsonResponse } from '../_shared/http.ts'
+import { corsHeaders, getClients, jsonResponse, readJsonObject, requestBodyErrorResponse } from '../_shared/http.ts'
 
 const INVALID_LOGIN = { error: 'invalid_login', message: 'The supplied login details are invalid or the account is not available.' }
 
@@ -14,7 +14,7 @@ Deno.serve(async req => {
 
   try {
     const { url, anon, service } = getClients()
-    const body = await req.json().catch(() => ({})) as { identity?: unknown; password?: unknown }
+    const body = await readJsonObject(req, 4 * 1024) as { identity?: unknown; password?: unknown }
     const identity = typeof body.identity === 'string' ? body.identity.trim() : ''
     const password = typeof body.password === 'string' ? body.password : ''
     if (!identity || identity.includes('@') || identity.length > 100 || !password || password.length > 1024) {
@@ -67,6 +67,8 @@ Deno.serve(async req => {
       token_type: session.token_type,
     }, 200, req)
   } catch (error) {
+    const bodyError = requestBodyErrorResponse(error, req)
+    if (bodyError) return bodyError
     console.error('Username sign-in failed', error instanceof Error ? error.name : 'unknown error')
     return jsonResponse({ error: 'temporarily_unavailable' }, 503, req)
   }

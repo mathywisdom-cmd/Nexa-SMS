@@ -173,10 +173,13 @@ begin
         'transition_provisioning_request', 'get_provisioning_request', 'claim_provisioning_request',
         'renew_provisioning_lease', 'begin_provisioning_cancellation', 'finish_provisioning_cancellation',
         'resume_owner_bootstrap_provisioning', 'get_my_auth_context', 'provision_platform_owner_profile',
-        'provision_school_and_first_admin', 'provision_school_staff_profile', 'consume_username_login_attempt'
+        'provision_school_and_first_admin', 'provision_school_staff_profile', 'consume_username_login_attempt',
+        'consume_owner_bootstrap_rate_limit', 'record_owner_bootstrap_security_event',
+        'reserve_owner_bootstrap_request', 'begin_provisioning_identity_creation'
       ) or (n.nspname = 'private' and p.proname in (
         'check_audit_actor_school', 'current_profile_id', 'current_school_id', 'has_permission',
-        'profile_has_permission', 'provisioning_payload_has_credentials'
+        'profile_has_permission', 'provisioning_payload_has_credentials',
+        'arm_owner_bootstrap_credential', 'bind_provisioning_auth_identity'
       )))
       and (
         p.proowner <> 'postgres'::regrole
@@ -204,6 +207,46 @@ begin
       where c.conrelid = 'public.users'::regclass and c.conname = 'users_super_admin_is_platform_only'
         and c.contype = 'c' and c.convalidated) <> 1 then
     raise exception 'platform owner school-null invariant is missing or unvalidated';
+  end if;
+
+  if has_table_privilege('anon', 'private.provisioning_identity_map', 'SELECT')
+     or has_table_privilege('authenticated', 'private.provisioning_identity_map', 'SELECT')
+     or has_table_privilege('service_role', 'private.provisioning_identity_map', 'SELECT')
+     or has_table_privilege('anon', 'private.owner_bootstrap_credentials', 'SELECT')
+     or has_table_privilege('authenticated', 'private.owner_bootstrap_credentials', 'SELECT')
+     or has_table_privilege('service_role', 'private.owner_bootstrap_credentials', 'SELECT')
+     or has_table_privilege('anon', 'private.owner_bootstrap_security_events', 'SELECT')
+     or has_table_privilege('authenticated', 'private.owner_bootstrap_security_events', 'SELECT')
+     or has_table_privilege('service_role', 'private.owner_bootstrap_security_events', 'SELECT') then
+    raise exception 'bootstrap credentials, identity map, or security events are directly readable';
+  end if;
+
+  if exists (
+    select 1 from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'private' and c.relname in (
+       'provisioning_identity_map', 'owner_bootstrap_credentials', 'owner_bootstrap_security_events'
+     ) and not (c.relrowsecurity and c.relforcerowsecurity)
+  ) then
+    raise exception 'private provisioning security tables must have RLS enabled and forced';
+  end if;
+
+  if not has_function_privilege('service_role', 'public.reserve_owner_bootstrap_request(uuid,jsonb,text,text,text)', 'EXECUTE')
+     or has_function_privilege('anon', 'public.reserve_owner_bootstrap_request(uuid,jsonb,text,text,text)', 'EXECUTE')
+     or has_function_privilege('authenticated', 'public.reserve_owner_bootstrap_request(uuid,jsonb,text,text,text)', 'EXECUTE')
+     or not has_function_privilege('service_role', 'public.consume_owner_bootstrap_rate_limit(text)', 'EXECUTE')
+     or not has_function_privilege('service_role', 'public.begin_provisioning_identity_creation(uuid,uuid)', 'EXECUTE')
+     or has_function_privilege('service_role', 'private.arm_owner_bootstrap_credential(text,timestamp with time zone)', 'EXECUTE')
+     or has_function_privilege('service_role', 'private.bind_provisioning_auth_identity()', 'EXECUTE') then
+    raise exception 'bootstrap and identity-correlation execution privileges are not scoped as intended';
+  end if;
+
+  if not exists (
+    select 1 from pg_catalog.pg_trigger t
+     where t.tgrelid = 'auth.users'::regclass and t.tgname = 'auth_users_bind_provisioning_identity'
+       and t.tgfoid = 'private.bind_provisioning_auth_identity()'::regprocedure
+       and t.tgenabled = 'O' and t.tgtype = 7 and not t.tgisinternal
+  ) then
+    raise exception 'Auth identity correlation trigger is missing, disabled, or bound to the wrong function';
   end if;
 end
 $test$;

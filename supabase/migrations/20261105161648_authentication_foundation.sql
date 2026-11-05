@@ -1,4 +1,4 @@
--- REVIEW STATUS: REJECTED proposal; do not apply to any hosted project.
+-- REVIEW STATUS: LOCAL SECURITY REMEDIATION PROPOSAL; not approved or applied to hosted Supabase.
 -- Nexa SMS Stage 1 authentication foundation.
 -- Supabase Auth owns credentials; public.users.password remains only as a
 -- nullable legacy compatibility column and is never read by the SPA.
@@ -104,6 +104,70 @@ grant select, insert, update on private.provisioning_requests to service_role;
 create index provisioning_requests_state_updated_idx on private.provisioning_requests(state, updated_at);
 create index provisioning_requests_actor_created_idx on private.provisioning_requests(actor_auth_user_id, created_at desc);
 
+-- Auth identity correlation is server-controlled and atomic with the Auth row
+-- insert. raw_user_meta_data is intentionally not used for recovery.
+create table private.provisioning_identity_map (
+  request_id uuid primary key references private.provisioning_requests(request_id),
+  email text not null,
+  auth_user_id uuid null,
+  state text not null check (state in ('reserved', 'auth_created', 'cancelled')),
+  lease_token uuid null,
+  lease_expires_at timestamptz null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint provisioning_identity_map_lease_pair check ((lease_token is null) = (lease_expires_at is null)),
+  constraint provisioning_identity_map_state check (
+    (state = 'reserved' and auth_user_id is null and lease_token is not null)
+    or (state = 'auth_created' and auth_user_id is not null and lease_token is null)
+    or (state = 'cancelled' and lease_token is null and lease_expires_at is null)
+  )
+);
+create unique index provisioning_identity_map_active_email_uq
+  on private.provisioning_identity_map(lower(email)) where state <> 'cancelled';
+create unique index provisioning_identity_map_auth_user_uq
+  on private.provisioning_identity_map(auth_user_id) where auth_user_id is not null;
+alter table private.provisioning_identity_map enable row level security;
+alter table private.provisioning_identity_map force row level security;
+revoke all on private.provisioning_identity_map from public, anon, authenticated, service_role;
+
+-- Bootstrap credentials contain only a SHA-256 verifier. The one-time slot is
+-- armed manually by the database owner for a short window and is consumed by
+-- one request ID under a row lock. Raw tokens never enter PostgreSQL.
+create table private.owner_bootstrap_credentials (
+  singleton boolean primary key default true check (singleton),
+  token_sha256 text null check (token_sha256 is null or token_sha256 ~ '^[a-f0-9]{64}$'),
+  expires_at timestamptz null,
+  consumed_request_id uuid null,
+  consumed_at timestamptz null,
+  completed_at timestamptz null,
+  revoked_at timestamptz null,
+  updated_at timestamptz not null default now(),
+  constraint owner_bootstrap_credentials_pair check ((token_sha256 is null) = (expires_at is null)),
+  constraint owner_bootstrap_credentials_consumption_pair check ((consumed_request_id is null) = (consumed_at is null))
+);
+insert into private.owner_bootstrap_credentials(singleton) values (true);
+alter table private.owner_bootstrap_credentials enable row level security;
+alter table private.owner_bootstrap_credentials force row level security;
+revoke all on private.owner_bootstrap_credentials from public, anon, authenticated, service_role;
+
+create table private.owner_bootstrap_security_events (
+  id bigint generated always as identity primary key,
+  source_hash text null check (source_hash is null or source_hash ~ '^[a-f0-9]{64}$'),
+  outcome text not null check (outcome in (
+    'attempt', 'rate_limited', 'credential_rejected', 'credential_expired', 'request_consumed',
+    'replay_rejected', 'owner_already_exists', 'owner_created', 'credential_armed'
+  )),
+  request_id uuid null,
+  created_at timestamptz not null default now()
+);
+create index owner_bootstrap_security_events_source_time_idx
+  on private.owner_bootstrap_security_events(source_hash, created_at desc);
+create index owner_bootstrap_security_events_created_idx
+  on private.owner_bootstrap_security_events(created_at);
+alter table private.owner_bootstrap_security_events enable row level security;
+alter table private.owner_bootstrap_security_events force row level security;
+revoke all on private.owner_bootstrap_security_events from public, anon, authenticated, service_role;
+
 -- The profile/school RPCs below are SECURITY INVOKER by design. Add the
 -- base-table privileges those RPCs require to the project's existing
 -- service_role grants; do not rewrite that role's pre-existing privileges.
@@ -207,6 +271,260 @@ alter function public.reserve_provisioning_request(uuid, text, uuid, jsonb, text
 revoke all on function public.reserve_provisioning_request(uuid, text, uuid, jsonb, text) from public, anon, authenticated;
 grant execute on function public.reserve_provisioning_request(uuid, text, uuid, jsonb, text) to service_role;
 
+create or replace function public.consume_owner_bootstrap_rate_limit(p_source_hash text)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+set row_security = off
+as $function$
+declare
+  attempt_count integer;
+begin
+  if p_source_hash !~ '^[a-f0-9]{64}$' then raise exception 'invalid bootstrap source fingerprint'; end if;
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(p_source_hash, 7128649235));
+  delete from private.owner_bootstrap_security_events where created_at < now() - interval '30 days';
+  select count(*) into attempt_count from private.owner_bootstrap_security_events
+   where source_hash = p_source_hash and created_at > now() - interval '15 minutes'
+     and outcome = 'attempt';
+  if attempt_count >= 5 then
+    insert into private.owner_bootstrap_security_events(source_hash, outcome) values (p_source_hash, 'rate_limited');
+    return false;
+  end if;
+  insert into private.owner_bootstrap_security_events(source_hash, outcome) values (p_source_hash, 'attempt');
+  return true;
+end
+$function$;
+alter function public.consume_owner_bootstrap_rate_limit(text) owner to postgres;
+revoke all on function public.consume_owner_bootstrap_rate_limit(text) from public, anon, authenticated;
+grant execute on function public.consume_owner_bootstrap_rate_limit(text) to service_role;
+
+create or replace function public.record_owner_bootstrap_security_event(
+  p_source_hash text, p_outcome text, p_request_id uuid default null
+) returns void
+language plpgsql
+security definer
+set search_path = ''
+set row_security = off
+as $function$
+begin
+  if p_source_hash !~ '^[a-f0-9]{64}$'
+     or p_outcome not in ('credential_rejected', 'credential_expired', 'replay_rejected') then
+    raise exception 'invalid bootstrap security event';
+  end if;
+  insert into private.owner_bootstrap_security_events(source_hash, outcome, request_id)
+  values (p_source_hash, p_outcome, p_request_id);
+end
+$function$;
+alter function public.record_owner_bootstrap_security_event(text, text, uuid) owner to postgres;
+revoke all on function public.record_owner_bootstrap_security_event(text, text, uuid) from public, anon, authenticated;
+grant execute on function public.record_owner_bootstrap_security_event(text, text, uuid) to service_role;
+
+-- Run manually as the database owner. Store only a client-computed SHA-256
+-- digest and a short expiry; this routine cannot be called by application roles.
+create or replace function private.arm_owner_bootstrap_credential(p_token_sha256 text, p_expires_at timestamptz)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+set row_security = off
+as $function$
+declare
+  credential_row private.owner_bootstrap_credentials%rowtype;
+  prior_request private.provisioning_requests%rowtype;
+begin
+  if p_token_sha256 !~ '^[a-f0-9]{64}$' or p_expires_at <= now()
+     or p_expires_at > now() + interval '24 hours' then
+    raise exception 'bootstrap verifier must be a SHA-256 hex digest with an expiry within 24 hours';
+  end if;
+  select * into credential_row from private.owner_bootstrap_credentials where singleton for update;
+  if exists (select 1 from public.users where user_type = 'super_admin') then
+    raise exception 'owner bootstrap is permanently closed because a platform owner exists';
+  end if;
+  if credential_row.consumed_request_id is not null then
+    select * into prior_request from private.provisioning_requests where request_id = credential_row.consumed_request_id;
+    if not found or prior_request.state <> 'failed_terminal' or prior_request.error_code <> 'cancelled'
+       or prior_request.profile_id is not null then
+      raise exception 'consumed bootstrap can only be re-armed after an explicitly completed cancellation';
+    end if;
+    update private.provisioning_identity_map set state = 'cancelled', lease_token = null, lease_expires_at = null,
+      updated_at = now() where request_id = credential_row.consumed_request_id and state = 'reserved';
+  end if;
+  update private.owner_bootstrap_credentials set token_sha256 = p_token_sha256,
+    expires_at = p_expires_at, consumed_request_id = null, consumed_at = null,
+    completed_at = null, revoked_at = null, updated_at = now() where singleton;
+  insert into private.owner_bootstrap_security_events(outcome) values ('credential_armed');
+end
+$function$;
+alter function private.arm_owner_bootstrap_credential(text, timestamptz) owner to postgres;
+revoke all on function private.arm_owner_bootstrap_credential(text, timestamptz) from public, anon, authenticated, service_role;
+
+create or replace function public.reserve_owner_bootstrap_request(
+  p_request_id uuid, p_payload jsonb, p_payload_hash text, p_token_hash text, p_source_hash text
+) returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+set row_security = off
+as $function$
+declare
+  credential_row private.owner_bootstrap_credentials%rowtype;
+  existing_request private.provisioning_requests%rowtype;
+  reserved jsonb;
+begin
+  if p_request_id is null or p_source_hash is null or p_token_hash is null
+     or p_payload is null or p_payload_hash is null
+     or p_source_hash !~ '^[a-f0-9]{64}$' or p_token_hash !~ '^[a-f0-9]{64}$'
+     or jsonb_typeof(p_payload) <> 'object' or jsonb_object_length(p_payload) <> 2
+     or p_payload->>'email' is null or p_payload->>'name' is null
+     or p_payload->>'email' !~ '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$'
+     or length(p_payload->>'email') > 100 or length(p_payload->>'name') not between 6 and 150
+     or p_payload_hash !~ '^[a-f0-9]{64}$' then
+    raise exception 'invalid owner bootstrap request';
+  end if;
+  select * into credential_row from private.owner_bootstrap_credentials where singleton for update;
+  if not found or credential_row.token_sha256 is null or credential_row.token_sha256 <> p_token_hash then
+    insert into private.owner_bootstrap_security_events(source_hash, outcome, request_id)
+    values (p_source_hash, 'credential_rejected', p_request_id);
+    return jsonb_build_object('ok', false, 'code', 'not_authorized');
+  end if;
+  if credential_row.consumed_request_id is not null
+     and credential_row.consumed_request_id <> p_request_id then
+    insert into private.owner_bootstrap_security_events(source_hash, outcome, request_id)
+    values (p_source_hash, 'replay_rejected', p_request_id);
+    return jsonb_build_object('ok', false, 'code', 'bootstrap_replayed');
+  end if;
+  if credential_row.consumed_request_id is null
+     and (credential_row.revoked_at is not null or credential_row.expires_at is null or credential_row.expires_at <= now()) then
+    insert into private.owner_bootstrap_security_events(source_hash, outcome, request_id)
+    values (p_source_hash, 'credential_expired', p_request_id);
+    return jsonb_build_object('ok', false, 'code', 'bootstrap_expired');
+  end if;
+  if credential_row.consumed_request_id = p_request_id then
+    if credential_row.completed_at is not null or credential_row.revoked_at is not null then
+      insert into private.owner_bootstrap_security_events(source_hash, outcome, request_id)
+      values (p_source_hash, 'replay_rejected', p_request_id);
+      return jsonb_build_object('ok', false, 'code', 'bootstrap_replayed');
+    end if;
+    select * into existing_request from private.provisioning_requests where request_id = p_request_id;
+    if not found or existing_request.operation <> 'owner_bootstrap'
+       or existing_request.payload_hash <> p_payload_hash or existing_request.payload <> p_payload then
+      insert into private.owner_bootstrap_security_events(source_hash, outcome, request_id)
+      values (p_source_hash, 'replay_rejected', p_request_id);
+      return jsonb_build_object('ok', false, 'code', 'request_conflict');
+    end if;
+  elsif exists (select 1 from public.users where user_type = 'super_admin') then
+    update private.owner_bootstrap_credentials set revoked_at = now(), updated_at = now() where singleton;
+    insert into private.owner_bootstrap_security_events(source_hash, outcome, request_id)
+    values (p_source_hash, 'owner_already_exists', p_request_id);
+    return jsonb_build_object('ok', false, 'code', 'owner_already_exists');
+  end if;
+
+  reserved := public.reserve_provisioning_request(p_request_id, 'owner_bootstrap', null, p_payload, p_payload_hash);
+  if credential_row.consumed_request_id is null then
+    update private.owner_bootstrap_credentials set consumed_request_id = p_request_id,
+      consumed_at = now(), updated_at = now() where singleton;
+    insert into private.owner_bootstrap_security_events(source_hash, outcome, request_id)
+    values (p_source_hash, 'request_consumed', p_request_id);
+  end if;
+  return jsonb_build_object('ok', true, 'request', reserved);
+end
+$function$;
+alter function public.reserve_owner_bootstrap_request(uuid, jsonb, text, text, text) owner to postgres;
+revoke all on function public.reserve_owner_bootstrap_request(uuid, jsonb, text, text, text) from public, anon, authenticated;
+grant execute on function public.reserve_owner_bootstrap_request(uuid, jsonb, text, text, text) to service_role;
+
+create or replace function public.begin_provisioning_identity_creation(p_request_id uuid, p_lease_token uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+set row_security = off
+as $function$
+declare
+  request_row private.provisioning_requests%rowtype;
+  identity_row private.provisioning_identity_map%rowtype;
+  requested_email text;
+begin
+  select * into request_row from private.provisioning_requests where request_id = p_request_id for update;
+  if not found or request_row.state not in ('pending', 'identity_created')
+     or request_row.lease_token is distinct from p_lease_token
+     or request_row.lease_expires_at is null or request_row.lease_expires_at <= clock_timestamp() then
+    raise exception 'provisioning worker does not own a live identity-creation lease';
+  end if;
+  requested_email := lower(case when request_row.operation = 'school_create'
+    then request_row.payload->>'admin_email' else request_row.payload->>'email' end);
+  if requested_email is null then raise exception 'provisioning request has no identity email'; end if;
+  select * into identity_row from private.provisioning_identity_map
+   where request_id = p_request_id for update;
+  if found then
+    if lower(identity_row.email) <> requested_email then raise exception 'identity request email changed'; end if;
+    if identity_row.state = 'auth_created' then
+      return jsonb_build_object('request_id', p_request_id, 'auth_user_id', identity_row.auth_user_id, 'state', identity_row.state);
+    end if;
+    if identity_row.state <> 'reserved' then raise exception 'identity intent is not reusable'; end if;
+    update private.provisioning_identity_map set lease_token = p_lease_token,
+      lease_expires_at = request_row.lease_expires_at, updated_at = now()
+     where request_id = p_request_id returning * into identity_row;
+  else
+    insert into private.provisioning_identity_map(request_id, email, state, lease_token, lease_expires_at)
+    values (p_request_id, requested_email, 'reserved', p_lease_token, request_row.lease_expires_at)
+    returning * into identity_row;
+  end if;
+  return jsonb_build_object('request_id', p_request_id, 'state', identity_row.state);
+end
+$function$;
+alter function public.begin_provisioning_identity_creation(uuid, uuid) owner to postgres;
+revoke all on function public.begin_provisioning_identity_creation(uuid, uuid) from public, anon, authenticated;
+grant execute on function public.begin_provisioning_identity_creation(uuid, uuid) to service_role;
+
+create or replace function private.bind_provisioning_auth_identity()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+set row_security = off
+as $function$
+declare
+  identity_row private.provisioning_identity_map%rowtype;
+  request_row private.provisioning_requests%rowtype;
+begin
+  -- Bind only Auth invitation inserts. A signup or unrelated Admin API
+  -- create for the same email must not consume a pending provisioning intent.
+  if new.invited_at is null then return new; end if;
+  select * into identity_row from private.provisioning_identity_map
+   where lower(email) = lower(new.email) and state = 'reserved' for update;
+  if not found then return new; end if;
+  select * into request_row from private.provisioning_requests where request_id = identity_row.request_id for update;
+  if request_row.state not in ('pending', 'identity_created')
+     or request_row.lease_token is distinct from identity_row.lease_token
+     or request_row.lease_expires_at <= clock_timestamp()
+     or identity_row.lease_expires_at <= clock_timestamp() then
+    raise exception 'provisioning identity intent is expired or no longer owned';
+  end if;
+  new.raw_app_meta_data := pg_catalog.jsonb_set(
+    coalesce(new.raw_app_meta_data, '{}'::jsonb), '{nexasms_provisioning_request_id}',
+    pg_catalog.to_jsonb(identity_row.request_id::text), true);
+  update private.provisioning_identity_map set auth_user_id = new.id, state = 'auth_created',
+    lease_token = null, lease_expires_at = null, updated_at = now()
+   where request_id = identity_row.request_id;
+  return new;
+end
+$function$;
+alter function private.bind_provisioning_auth_identity() owner to postgres;
+revoke all on function private.bind_provisioning_auth_identity() from public, anon, authenticated, service_role;
+do $auth_identity_trigger$
+begin
+  if exists (select 1 from pg_catalog.pg_trigger where tgrelid = 'auth.users'::regclass
+     and tgname = 'auth_users_bind_provisioning_identity' and not tgisinternal) then
+    raise exception 'trigger auth_users_bind_provisioning_identity already exists; inspect it before proceeding';
+  end if;
+end
+$auth_identity_trigger$;
+create trigger auth_users_bind_provisioning_identity
+before insert on auth.users
+for each row execute function private.bind_provisioning_auth_identity();
+
 create or replace function public.record_provisioning_identity(p_request_id uuid, p_auth_user_id uuid, p_lease_token uuid)
 returns jsonb
 language plpgsql
@@ -216,6 +534,7 @@ set row_security = off
 as $function$
 declare
   request_row private.provisioning_requests%rowtype;
+  identity_row private.provisioning_identity_map%rowtype;
   actual_email text;
   requested_email text;
 begin
@@ -227,14 +546,25 @@ begin
      or request_row.lease_expires_at <= clock_timestamp() then
     raise exception 'provisioning worker does not own a live lease';
   end if;
-  select lower(au.email) into actual_email from auth.users au
-   where au.id = p_auth_user_id
-     and au.raw_user_meta_data->>'nexasms_provisioning_request_id' = p_request_id::text;
+   select lower(au.email) into actual_email from auth.users au where au.id = p_auth_user_id
+      and au.raw_app_meta_data->>'nexasms_provisioning_request_id' = p_request_id::text;
   requested_email := lower(case when request_row.operation = 'school_create'
     then request_row.payload->>'admin_email' else request_row.payload->>'email' end);
   if actual_email is null or requested_email is null or actual_email <> requested_email then
     raise exception 'Auth identity does not match the reserved request';
   end if;
+   select * into identity_row from private.provisioning_identity_map where request_id = p_request_id for update;
+   if found then
+     if identity_row.state <> 'auth_created' or identity_row.auth_user_id is distinct from p_auth_user_id
+        or lower(identity_row.email) <> requested_email then
+       raise exception 'Auth identity does not match the immutable provisioning map';
+     end if;
+   else
+     -- This path supports trusted server-side Auth Admin creation used by the
+     -- isolated integration suite. User clients cannot set app_metadata.
+     insert into private.provisioning_identity_map(request_id, email, auth_user_id, state)
+     values (p_request_id, requested_email, p_auth_user_id, 'auth_created');
+   end if;
   if request_row.auth_user_id is not null and request_row.auth_user_id <> p_auth_user_id then
     raise exception 'request is already linked to another Auth identity';
   end if;
@@ -276,10 +606,11 @@ begin
   if not found then raise exception 'provisioning request not found'; end if;
   requested_email := lower(case when request_row.operation = 'school_create'
     then request_row.payload->>'admin_email' else request_row.payload->>'email' end);
-  select au.id into matching_user_id from auth.users au
-   where lower(au.email) = requested_email
-     and au.raw_user_meta_data->>'nexasms_provisioning_request_id' = p_request_id::text
-   limit 1;
+  select m.auth_user_id into matching_user_id
+    from private.provisioning_identity_map m
+    join auth.users au on au.id = m.auth_user_id
+   where m.request_id = p_request_id and m.state = 'auth_created'
+     and lower(m.email) = requested_email and lower(au.email) = requested_email;
   select exists(select 1 from auth.users au where lower(au.email) = requested_email) into email_occupied;
   return jsonb_build_object('auth_user_id', matching_user_id,
     'email_occupied', coalesce(email_occupied, false) and matching_user_id is null);
@@ -357,6 +688,11 @@ begin
     cancelled_at = case when p_next_state = 'failed_terminal' and p_error_code = 'cancelled' then now() else cancelled_at end,
     updated_at = now()
    where request_id = p_request_id returning * into request_row;
+  if p_next_state = 'failed_terminal' and p_error_code <> 'cancelled' then
+    update private.provisioning_identity_map set state = 'cancelled', lease_token = null,
+      lease_expires_at = null, updated_at = now()
+     where request_id = p_request_id and state = 'reserved' and auth_user_id is null;
+  end if;
   return jsonb_build_object('request_id', request_row.request_id, 'operation', request_row.operation,
     'state', request_row.state, 'auth_user_id', request_row.auth_user_id, 'profile_id', request_row.profile_id,
     'school_id', request_row.school_id, 'result', request_row.result, 'error_code', request_row.error_code);
@@ -489,13 +825,13 @@ begin
       raise exception 'recovery operator is not authorized';
     end if;
   end if;
+  requested_email := lower(case when request_row.operation = 'school_create'
+    then request_row.payload->>'admin_email' else request_row.payload->>'email' end);
   if request_row.auth_user_id is null and request_row.payload <> '{}'::jsonb then
-    requested_email := lower(case when request_row.operation = 'school_create'
-      then request_row.payload->>'admin_email' else request_row.payload->>'email' end);
-    select au.id into orphan_auth_user_id from auth.users au
-     where lower(au.email) = requested_email
-       and au.raw_user_meta_data->>'nexasms_provisioning_request_id' = p_request_id::text
-     limit 1;
+    select m.auth_user_id into orphan_auth_user_id
+      from private.provisioning_identity_map m join auth.users au on au.id = m.auth_user_id
+     where m.request_id = p_request_id and m.state = 'auth_created'
+       and lower(m.email) = requested_email and lower(au.email) = requested_email;
     if orphan_auth_user_id is not null then
       update private.provisioning_requests set auth_user_id = orphan_auth_user_id, updated_at = now()
        where request_id = p_request_id returning * into request_row;
@@ -514,7 +850,7 @@ begin
     lease_token = null, lease_expires_at = null,
     updated_at = now() where request_id = p_request_id returning * into request_row;
   return jsonb_build_object('request_id', request_row.request_id, 'state', request_row.state,
-    'auth_user_id', request_row.auth_user_id, 'payload', request_row.payload);
+    'auth_user_id', request_row.auth_user_id, 'payload', request_row.payload, 'identity_email', requested_email);
 end
 $function$;
 alter function public.begin_provisioning_cancellation(uuid, uuid) owner to postgres;
@@ -539,6 +875,8 @@ begin
     raise exception 'bootstrap operator cannot cancel this operation';
   end if;
   if p_succeeded then
+    update private.provisioning_identity_map set state = 'cancelled', lease_token = null,
+      lease_expires_at = null, updated_at = now() where request_id = p_request_id;
     update private.provisioning_requests set state = 'failed_terminal', error_code = 'cancelled', payload = '{}'::jsonb,
       cancelled_by = p_operator_auth_user_id, cancelled_at = now(), updated_at = now()
      where request_id = p_request_id returning * into request_row;
@@ -729,6 +1067,11 @@ begin
   end if;
   if request_row.state in ('profile_created', 'completed') then return request_row.profile_id; end if;
   if request_row.state <> 'identity_created' then raise exception 'owner request is not ready for profile creation'; end if;
+  if not exists (select 1 from private.owner_bootstrap_credentials c
+    where c.singleton and c.consumed_request_id = p_request_id
+      and c.completed_at is null and c.revoked_at is null) then
+    raise exception 'owner bootstrap credential was not atomically consumed for this request';
+  end if;
   select au.email into auth_email from auth.users au where au.id = p_auth_user_id;
   if auth_email is null then
     raise exception 'provisioning identity does not exist in Supabase Auth';
@@ -743,6 +1086,10 @@ begin
     update private.provisioning_requests set state = 'profile_created', profile_id = v_profile_id,
       result = jsonb_build_object('profile_id', v_profile_id), updated_at = clock_timestamp()
      where request_id = p_request_id;
+     update private.owner_bootstrap_credentials set
+       completed_at = coalesce(completed_at, now()), revoked_at = coalesce(revoked_at, now()), updated_at = now()
+      where singleton and consumed_request_id = p_request_id;
+     insert into private.owner_bootstrap_security_events(outcome, request_id) values ('owner_created', p_request_id);
     return v_profile_id;
   end if;
   if exists (select 1 from public.users where user_type = 'super_admin') then
@@ -762,6 +1109,9 @@ begin
   update private.provisioning_requests set state = 'profile_created', profile_id = v_profile_id,
     result = jsonb_build_object('profile_id', v_profile_id), updated_at = clock_timestamp()
    where request_id = p_request_id;
+  update private.owner_bootstrap_credentials set completed_at = now(), revoked_at = now(), updated_at = now()
+   where singleton and consumed_request_id = p_request_id;
+  insert into private.owner_bootstrap_security_events(outcome, request_id) values ('owner_created', p_request_id);
   return v_profile_id;
 end
 $function$;

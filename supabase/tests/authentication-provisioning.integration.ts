@@ -27,7 +27,7 @@ async function createIdentity(email: string, request: string) {
     email,
     password,
     email_confirm: true,
-    user_metadata: { nexasms_provisioning_request_id: request },
+    app_metadata: { nexasms_provisioning_request_id: request },
   })
   if (error || !data.user) throw new Error(`Local Auth identity creation failed: ${error?.message ?? 'missing user'}`)
   return data.user.id
@@ -168,7 +168,7 @@ Deno.test('real local Auth, provisioning authorization, tenant isolation, leases
     assert(loginResponse.status === 401 && loginBody.error === 'invalid_login', 'username-login Edge Function returned an unsafe or unexpected invalid-login response')
 
     const badBootstrap = await fetch(`${functionsUrl}/bootstrap-owner`, {
-      method: 'POST', headers: { apikey: anonKey!, 'content-type': 'application/json', 'x-bootstrap-token': 'incorrect-test-token' },
+      method: 'POST', headers: { apikey: anonKey!, 'content-type': 'application/json', 'cf-connecting-ip': '192.0.2.19', 'x-bootstrap-token': 'incorrect-test-token' },
       body: JSON.stringify({ request_id: requestId(), email: `unused-${suffix}@example.test`, name: 'CI Invalid Bootstrap' }),
     })
     assert(badBootstrap.status === 403, 'owner bootstrap Edge Function accepted an invalid bootstrap token')
@@ -185,48 +185,65 @@ Deno.test('real local Auth, provisioning authorization, tenant isolation, leases
     })
     assert(unauthorizedRecovery.status === 401, 'unauthenticated provisioning recovery was not rejected')
 
-    // Two independent bootstrap requests reach the database owner lock in the
-    // same concurrent wave. The unique index/lock must permit one profile only.
+    // Distinct concurrent bootstrap payloads race on the one-time database
+    // credential. Only the atomically consumed request may create an Auth user.
     const ownerRequests = [requestId(), requestId()]
-    const owners = await Promise.all(ownerRequests.map(async (id, index) => {
+    const ownerInputs = ownerRequests.map((id, index) => {
       const email = `ci-owner-${index}-${suffix}@example.test`
-      const authId = await createIdentity(email, id)
-      authIds.push(authId)
-      const request = await reserve(id, 'owner_bootstrap', null, { email, name: `CI Platform Owner ${index}` })
-      const lease = await claimAndBind(id, authId)
-      return { id, authId, email, name: `CI Platform Owner ${index}`, lease, request }
-    }))
-    const ownerAttempts = await Promise.allSettled(owners.map(owner => service.rpc('provision_platform_owner_profile', {
-      p_request_id: owner.id, p_auth_user_id: owner.authId, p_name: owner.name, p_lease_token: owner.lease,
-    })))
-    const successfulOwners = ownerAttempts.filter(result => result.status === 'fulfilled' && !result.value.error)
-    const ownerFailureDetails = ownerAttempts.map((result, index) => {
-      if (result.status === 'rejected') return `owner${index}: ${String(result.reason?.message ?? 'request rejected')}`
-      if (result.value.error) return `owner${index}: ${result.value.error.code ?? 'database_error'} ${result.value.error.message ?? 'no message'}`
-      return `owner${index}: succeeded`
+      return { id, email, name: `CI Platform Owner ${index}` }
     })
-    assert(successfulOwners.length === 1,
-      `expected exactly one concurrent owner bootstrap winner; got ${successfulOwners.length}; ${ownerFailureDetails.join('; ')}`)
-    const ownerIndex = ownerAttempts.findIndex(result => result.status === 'fulfilled' && !result.value.error)
-    const owner = owners[ownerIndex]
+    const ownerAttempts = await Promise.all(ownerInputs.map(async owner => {
+      const response = await fetch(`${functionsUrl}/bootstrap-owner`, {
+        method: 'POST',
+        headers: {
+          apikey: anonKey!, 'content-type': 'application/json', 'cf-connecting-ip': '192.0.2.20',
+          'x-bootstrap-token': Deno.env.get('NEXASMS_OWNER_BOOTSTRAP_TOKEN')!,
+        },
+        body: JSON.stringify({ request_id: owner.id, email: owner.email, name: owner.name }),
+      })
+      return { status: response.status, body: await response.json() as Record<string, unknown>, request: owner }
+    }))
+    const successfulOwners = ownerAttempts.filter(result => result.status === 200)
+    assert(successfulOwners.length === 1, `expected one bootstrap token consumer; got ${successfulOwners.length}`)
+    const owner = successfulOwners[0].request
+    const ownerLookup = await service.rpc('lookup_provisioning_identity', { p_request_id: owner.id })
+    assert(!ownerLookup.error && ownerLookup.data?.auth_user_id, 'bootstrap Auth identity was not durably correlated')
+    const ownerAuthId = ownerLookup.data.auth_user_id as string
+    authIds.push(ownerAuthId)
+    const ownerCredential = await service.auth.admin.updateUserById(ownerAuthId, { password, email_confirm: true })
+    assert(!ownerCredential.error, 'could not prepare disposable invited owner for CI sign-in')
     const ownerCount = await service.from('users').select('id', { count: 'exact', head: true }).eq('user_type', 'super_admin')
     assert(!ownerCount.error && ownerCount.count === 1, `expected one owner profile; count=${ownerCount.count}`)
-    await complete(owner.id, owner.lease)
-    const loser = owners[1 - ownerIndex]
-    await service.auth.admin.deleteUser(loser.authId)
-    authIds.splice(authIds.indexOf(loser.authId), 1)
+    const loser = ownerAttempts.find(result => result.status !== 200)!
+    assert(loser.status >= 400, 'competing bootstrap request was not rejected')
+    const loserUsers = await service.auth.admin.listUsers({ page: 1, perPage: 1000 })
+    assert(!loserUsers.error && !loserUsers.data.users.some(user => user.email === loser.request.email),
+      'losing bootstrap request created an unwanted Auth identity')
 
-    // Re-reserving the exact completed request returns its durable state and
-    // cannot create another identity/profile.
-    const ownerRetry = await reserve(owner.id, 'owner_bootstrap', null, { email: owner.email, name: owner.name })
-    assert(ownerRetry.state === 'completed', 'same idempotency key did not return the completed owner request')
-    let conflictingRetryRejected = false
-    try {
-      await reserve(owner.id, 'owner_bootstrap', null, { email: owner.email, name: 'Different Owner Payload' })
-    } catch {
-      conflictingRetryRejected = true
+    for (const retry of [
+      { request_id: owner.id, email: owner.email, name: owner.name },
+      { request_id: requestId(), email: `ci-replay-${suffix}@example.test`, name: 'Replay Platform Owner' },
+    ]) {
+      const response = await fetch(`${functionsUrl}/bootstrap-owner`, {
+        method: 'POST', headers: {
+          apikey: anonKey!, 'content-type': 'application/json', 'cf-connecting-ip': '192.0.2.20',
+          'x-bootstrap-token': Deno.env.get('NEXASMS_OWNER_BOOTSTRAP_TOKEN')!,
+        }, body: JSON.stringify(retry),
+      })
+      assert(response.status >= 400, 'a consumed bootstrap credential was replayed')
     }
-    assert(conflictingRetryRejected, 'completed idempotency key accepted a different payload')
+    const replayUsers = await service.auth.admin.listUsers({ page: 1, perPage: 1000 })
+    assert(!replayUsers.error && !replayUsers.data.users.some(user => user.email?.startsWith(`ci-replay-${suffix}`)),
+      'bootstrap replay with a different email created an Auth identity')
+
+    // User-editable metadata changes cannot disturb the immutable DB mapping.
+    const metadataMutation = await service.auth.admin.updateUserById(ownerAuthId, {
+      user_metadata: { nexasms_provisioning_request_id: requestId() },
+    })
+    assert(!metadataMutation.error, 'could not perform the disposable metadata-mutation check')
+    const mappedAfterMutation = await service.rpc('lookup_provisioning_identity', { p_request_id: owner.id })
+    assert(!mappedAfterMutation.error && mappedAfterMutation.data?.auth_user_id === ownerAuthId,
+      'user-editable metadata mutation broke server-controlled provisioning reconciliation')
     const ownerClient = await signIn(owner.email)
     const ownerContext = await ownerClient.rpc('get_my_auth_context')
     assert(!ownerContext.error && ownerContext.data?.profile?.user_type === 'super_admin'
@@ -234,9 +251,9 @@ Deno.test('real local Auth, provisioning authorization, tenant isolation, leases
       && ownerContext.data.permissions.includes('platform.schools.manage'),
     'platform owner Auth identity did not resolve to the platform-only permission context')
 
-    const schoolA = await createSchoolAdmin(owner.authId, `ci-admin-a-${suffix}@example.test`, `CIA${suffix.slice(0, 6)}`)
+    const schoolA = await createSchoolAdmin(ownerAuthId, `ci-admin-a-${suffix}@example.test`, `CIA${suffix.slice(0, 6)}`)
     authIds.push(schoolA.adminAuthId)
-    const schoolB = await createSchoolAdmin(owner.authId, `ci-admin-b-${suffix}@example.test`, `CIB${suffix.slice(0, 6)}`)
+    const schoolB = await createSchoolAdmin(ownerAuthId, `ci-admin-b-${suffix}@example.test`, `CIB${suffix.slice(0, 6)}`)
     authIds.push(schoolB.adminAuthId)
     const teacherA = await createTeacher(schoolA, 'A')
     authIds.push(teacherA.authId)
@@ -376,7 +393,7 @@ Deno.test('real local Auth, provisioning authorization, tenant isolation, leases
     const stale = await service.rpc('renew_provisioning_lease', { p_request_id: recoveryId, p_lease_token: crypto.randomUUID() })
     assert(!!stale.error, 'wrong worker renewed a live lease')
     const earlyCancel = await service.rpc('begin_provisioning_cancellation', {
-      p_request_id: recoveryId, p_operator_auth_user_id: owner.authId,
+      p_request_id: recoveryId, p_operator_auth_user_id: ownerAuthId,
     })
     assert(!!earlyCancel.error, 'cancellation proceeded while a worker held a live lease')
     const recoverable = await service.rpc('transition_provisioning_request', {
@@ -385,7 +402,7 @@ Deno.test('real local Auth, provisioning authorization, tenant isolation, leases
     })
     assert(!recoverable.error, `recoverable transition failed: ${recoverable.error?.message ?? 'unknown'}`)
     const cancellation = await service.rpc('begin_provisioning_cancellation', {
-      p_request_id: recoveryId, p_operator_auth_user_id: owner.authId,
+      p_request_id: recoveryId, p_operator_auth_user_id: ownerAuthId,
     })
     assert(!cancellation.error, `authorized cancellation/recovery failed: ${cancellation.error?.message ?? 'unknown'}`)
     assert(cancellation.data?.auth_user_id === recoveryAuth, 'recovery did not return the Auth identity bound to the request')
@@ -394,7 +411,7 @@ Deno.test('real local Auth, provisioning authorization, tenant isolation, leases
     const identityAfterDelete = await service.auth.admin.getUserById(recoveryAuth)
     assert(identityAfterDelete.error?.status === 404, 'Auth compensation was not confirmed by reading actual Auth state')
     const finalized = await service.rpc('finish_provisioning_cancellation', {
-      p_request_id: recoveryId, p_operator_auth_user_id: owner.authId, p_succeeded: true,
+      p_request_id: recoveryId, p_operator_auth_user_id: ownerAuthId, p_succeeded: true,
     })
     assert(!finalized.error && finalized.data?.state === 'failed_terminal', 'successful compensation did not produce terminal cancellation')
 
@@ -402,7 +419,7 @@ Deno.test('real local Auth, provisioning authorization, tenant isolation, leases
     const audit = await service.from('audit_logs').select('actor_id,school_id,action')
       .eq('action', 'school.created').eq('school_id', schoolA.id).maybeSingle()
     assert(!audit.error && audit.data?.actor_id, `school creation audit missing: ${audit.error?.message ?? 'unknown'}`)
-    const ownerProfile = await service.from('users').select('id').eq('auth_user_id', owner.authId).single()
+    const ownerProfile = await service.from('users').select('id').eq('auth_user_id', ownerAuthId).single()
     assert(!ownerProfile.error && audit.data.actor_id === ownerProfile.data.id, 'audit trigger actor did not match the verified platform owner')
 
     const adminAProfile = await service.from('users').select('id').eq('auth_user_id', schoolA.adminAuthId).single()
@@ -412,7 +429,7 @@ Deno.test('real local Auth, provisioning authorization, tenant isolation, leases
     const crossSchoolAudit = await auditInsertWithSubject(schoolA.adminAuthId, adminAProfile.data.id, schoolB.id, 'ci.audit.cross-school')
     assert(!crossSchoolAudit.success && crossSchoolAudit.error.includes('audit actor school does not match audit school'),
       'audit trigger did not reject a school administrator writing an audit event for a foreign school')
-    const ownerCrossSchoolAudit = await auditInsertWithSubject(owner.authId, ownerProfile.data.id, schoolB.id, 'ci.audit.platform-owner')
+    const ownerCrossSchoolAudit = await auditInsertWithSubject(ownerAuthId, ownerProfile.data.id, schoolB.id, 'ci.audit.platform-owner')
     assert(ownerCrossSchoolAudit.success, 'platform owner audit behavior across school context changed unexpectedly')
 
     const impersonation = await service.from('audit_logs').insert({

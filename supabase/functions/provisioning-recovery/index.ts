@@ -1,22 +1,14 @@
-import { authenticateCaller, corsHeaders, getClients, hasPermission, jsonResponse, profileFrom, readProvisioningRequest, changeProvisioningState, ProvisioningError, validRequestId } from '../_shared/http.ts'
+import { authenticateCaller, corsHeaders, getClients, hasPermission, jsonResponse, profileFrom, readJsonObject, requestBodyErrorResponse, readProvisioningRequest, changeProvisioningState, ProvisioningError, validRequestId } from '../_shared/http.ts'
 import { runProvisioningRequest, safeProvisioningResponse } from '../_shared/provisioning.ts'
 import { cancelProvisioningRequest } from '../_shared/recovery.ts'
-
-function tokenMatches(expected: string, supplied: string): boolean {
-  const left = new TextEncoder().encode(expected)
-  const right = new TextEncoder().encode(supplied)
-  if (left.length < 32 || left.length !== right.length) return false
-  let difference = 0
-  for (let index = 0; index < left.length; index++) difference |= left[index] ^ right[index]
-  return difference === 0
-}
+import { expiringTokenMatches } from '../_shared/operator-token.ts'
 
 Deno.serve(async req => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders(req) })
   if (req.method !== 'POST') return jsonResponse({ error: 'method_not_allowed' }, 405, req)
 
   try {
-    const input = await req.json() as { request_id?: unknown; action?: unknown }
+    const input = await readJsonObject(req, 4 * 1024) as { request_id?: unknown; action?: unknown }
     const requestId = typeof input.request_id === 'string' ? input.request_id : null
     const action = input.action
     if (!validRequestId(requestId) || !['status', 'resume', 'cancel'].includes(String(action))) {
@@ -38,7 +30,7 @@ Deno.serve(async req => {
     } else {
       const expected = Deno.env.get('NEXASMS_PROVISIONING_OPERATOR_TOKEN') ?? ''
       const supplied = req.headers.get('x-provisioning-operator-token') ?? ''
-      if (!tokenMatches(expected, supplied)) return jsonResponse({ error: 'unauthorized' }, 401, req)
+      if (!expiringTokenMatches(expected, supplied, Deno.env.get('NEXASMS_PROVISIONING_OPERATOR_TOKEN_EXPIRES_AT'))) return jsonResponse({ error: 'unauthorized' }, 401, req)
       service = getClients().service
       bootstrapOperator = true
     }
@@ -95,6 +87,8 @@ Deno.serve(async req => {
       return jsonResponse({ error: 'cancellation_recovery_required', request_id: requestId }, 503, req)
     }
   } catch (error) {
+    const bodyError = requestBodyErrorResponse(error, req)
+    if (bodyError) return bodyError
     console.error('Provisioning recovery failed', error instanceof ProvisioningError ? error.code : 'unknown')
     const message = error instanceof Error ? error.message : ''
     return jsonResponse({ error: message === 'unauthorized' ? 'unauthorized' : message === 'unprovisioned' ? 'unprovisioned' : 'recovery_unavailable' }, message === 'unauthorized' ? 401 : message === 'unprovisioned' ? 403 : 503, req)

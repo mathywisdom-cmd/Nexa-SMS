@@ -25,6 +25,8 @@ async function assertRejects(operation: () => Promise<unknown>) {
 type FakeOptions = {
   inviteFailure?: boolean
   inviteTimeoutAfterCreate?: boolean
+  mutateUserMetadataAfterInvite?: boolean
+  omitServerMarkerAfterInvite?: boolean
   profileFailureCount?: number
   commitThenLoseResponse?: boolean
   deleteFailure?: boolean
@@ -37,7 +39,9 @@ type FakeOptions = {
 
 function fakeService(options: FakeOptions = {}) {
   const authUsers = new Map<string, Record<string, unknown>>()
+  const identityMap = new Map<string, string>()
   let request: Record<string, unknown> | null = null
+  let identityIntent: { requestId: string; leaseToken: string } | null = null
   let nextUser = 1
   let profileCreates = 0
   let schoolCreates = 0
@@ -50,7 +54,7 @@ function fakeService(options: FakeOptions = {}) {
   let renewFailureCount = options.renewFailureCount ?? 0
   let renewalCount = 0
   const admin = {
-    inviteUserByEmail: async (email: string, config: { data?: Record<string, unknown> }) => {
+    inviteUserByEmail: async (email: string) => {
       if (options.inviteDelayMs) await new Promise(resolve => setTimeout(resolve, options.inviteDelayMs))
       const exists = [...authUsers.values()].some(user => user.email === email)
       if (exists) return { data: { user: null }, error: { message: 'already registered' } }
@@ -59,8 +63,18 @@ function fakeService(options: FakeOptions = {}) {
         return { data: { user: null }, error: { message: 'invite unavailable' } }
       }
       const id = `auth-${nextUser++}`
-      const user = { id, email, user_metadata: config.data ?? {} }
+      if (!identityIntent) return { data: { user: null }, error: { message: 'missing durable identity intent' } }
+      const user = {
+        id, email, user_metadata: {},
+        app_metadata: options.omitServerMarkerAfterInvite
+          ? {}
+          : { nexasms_provisioning_request_id: identityIntent.requestId },
+      }
+      if (options.mutateUserMetadataAfterInvite) {
+        user.user_metadata = { nexasms_provisioning_request_id: 'attacker-controlled-value' }
+      }
       authUsers.set(id, user)
+      if (!options.omitServerMarkerAfterInvite) identityMap.set(identityIntent.requestId, id)
       if (options.inviteTimeoutAfterCreate) return { data: { user: null }, error: { message: 'response timed out' } }
       return { data: { user }, error: null }
     },
@@ -74,6 +88,7 @@ function fakeService(options: FakeOptions = {}) {
         return { error: { message: 'delete failed' } }
       }
       authUsers.delete(id)
+      for (const [requestId, authId] of identityMap) if (authId === id) identityMap.delete(requestId)
       return { error: null }
     },
   }
@@ -106,6 +121,11 @@ function fakeService(options: FakeOptions = {}) {
           || !['pending', 'identity_created'].includes(String(request.state))) {
           return { data: null, error: { message: 'lease not owned' } }
         }
+        const identity = authUsers.get(String(args.p_auth_user_id))
+        if ((identity?.app_metadata as Record<string, unknown> | undefined)?.nexasms_provisioning_request_id !== args.p_request_id) {
+          return { data: null, error: { message: 'identity correlation mismatch' } }
+        }
+        if (identityMap.get(String(args.p_request_id)) !== args.p_auth_user_id) identityMap.set(String(args.p_request_id), String(args.p_auth_user_id))
         request.auth_user_id = args.p_auth_user_id
         request.state = 'identity_created'
         return { data: { state: request.state }, error: null }
@@ -128,6 +148,14 @@ function fakeService(options: FakeOptions = {}) {
         renewalCount++
         return { data: { lease_expires_at: new Date(Number(request.lease_expires_at)).toISOString() }, error: null }
       }
+      if (name === 'begin_provisioning_identity_creation') {
+        if (request.lease_token !== args.p_lease_token || Number(request.lease_expires_at) <= Date.now()
+          || !['pending', 'identity_created'].includes(String(request.state))) {
+          return { data: null, error: { message: 'lease not owned' } }
+        }
+        identityIntent = { requestId: String(args.p_request_id), leaseToken: String(args.p_lease_token) }
+        return { data: { request_id: args.p_request_id, state: 'reserved' }, error: null }
+      }
       if (name === 'claim_provisioning_request') {
         if (request.state === 'completed') return { data: { ...request }, error: null }
         if (!['pending', 'identity_created', 'profile_created'].includes(String(request.state))) {
@@ -144,8 +172,9 @@ function fakeService(options: FakeOptions = {}) {
       if (name === 'lookup_provisioning_identity') {
         const requestPayload = request?.payload as Record<string, unknown>
         const email = request?.operation === 'school_create' ? requestPayload.admin_email : requestPayload.email
-        const id = [...authUsers.entries()].find(([, user]) => user.email === email
-          && (user.user_metadata as Record<string, unknown>).nexasms_provisioning_request_id === args.p_request_id)?.[0] ?? null
+        const mappedId = identityMap.get(String(args.p_request_id))
+        const mappedUser = mappedId ? authUsers.get(mappedId) : null
+        const id = mappedUser?.email === email ? mappedId : null
         const emailOccupied = [...authUsers.values()].some(user => user.email === email)
         return { data: { auth_user_id: id, email_occupied: emailOccupied && !id }, error: null }
       }
@@ -171,7 +200,9 @@ function fakeService(options: FakeOptions = {}) {
         if (Number(request.lease_expires_at) > Date.now()) return { data: null, error: { message: 'worker active' } }
         request.state = 'cancelling'
         request.recovered_by = args.p_operator_auth_user_id
-        return { data: { auth_user_id: request.auth_user_id }, error: null }
+        const requestPayload = request.payload as Record<string, unknown>
+        const expectedEmail = request.operation === 'school_create' ? requestPayload.admin_email : requestPayload.email
+        return { data: { auth_user_id: request.auth_user_id, identity_email: expectedEmail ?? null }, error: null }
       }
       if (name === 'finish_provisioning_cancellation') {
         if (finishFailureCount > 0) {
@@ -180,6 +211,7 @@ function fakeService(options: FakeOptions = {}) {
         }
         request.state = args.p_succeeded ? 'failed_terminal' : 'failed_recoverable'
         request.error_code = args.p_succeeded ? 'cancelled' : 'compensation_failed'
+        if (args.p_succeeded) identityMap.delete(String(args.p_request_id))
         return { data: { state: request.state }, error: null }
       }
       if (name === 'provision_school_and_first_admin' || name === 'provision_school_staff_profile' || name === 'provision_platform_owner_profile') {
@@ -220,6 +252,7 @@ function fakeService(options: FakeOptions = {}) {
   return {
     service: service as unknown as SupabaseClient,
     authUsers,
+    identityMap,
     get request() { return request as Record<string, unknown> | null },
     get counts() { return { identities: authUsers.size, profiles: profileCreates, schools: schoolCreates, owners: ownerCount } },
     get renewals() { return renewalCount },
@@ -252,12 +285,20 @@ Deno.test('invite failure remains retryable and creates only one school/profile'
   assertEquals(fake.counts, { identities: 1, profiles: 1, schools: 1, owners: 0 })
 })
 
-Deno.test('Auth invite created identity but lost response is reconciled by request marker', async () => {
-  const fake = fakeService({ inviteTimeoutAfterCreate: true })
+Deno.test('Auth invite created identity but lost response reconciles after user metadata mutation', async () => {
+  const fake = fakeService({ inviteTimeoutAfterCreate: true, mutateUserMetadataAfterInvite: true })
   const req = await reserve(fake)
   await runProvisioningRequest(fake.service, req)
   assertEquals(fake.counts, { identities: 1, profiles: 1, schools: 1, owners: 0 })
   assertEquals(fake.request?.state, 'completed')
+})
+
+Deno.test('missing server-controlled Auth marker is rejected without creating a profile', async () => {
+  const fake = fakeService({ omitServerMarkerAfterInvite: true })
+  const req = await reserve(fake)
+  await assertRejects(() => runProvisioningRequest(fake.service, req))
+  assertEquals(fake.counts.profiles, 0)
+  assertEquals(fake.request?.state, 'failed_terminal')
 })
 
 Deno.test('profile insertion failure resumes the linked Auth identity without duplicates', async () => {
@@ -331,7 +372,8 @@ Deno.test('failed Auth compensation is recorded as retryable rather than deletin
   const fake = fakeService({ deleteFailure: true })
   const userId = 'auth-orphan'
   const req = await reserve(fake)
-  fake.authUsers.set(userId, { id: userId, email: payload.admin_email, user_metadata: { nexasms_provisioning_request_id: requestId } })
+  fake.authUsers.set(userId, { id: userId, email: payload.admin_email, user_metadata: {}, app_metadata: { nexasms_provisioning_request_id: requestId } })
+  fake.identityMap.set(requestId, userId)
   fake.request!.auth_user_id = userId
   await markRecoverable(fake)
   const failed = await cancelProvisioningRequest(fake.service, requestId, 'operator-auth-id')
@@ -347,7 +389,8 @@ Deno.test('cancellation retry reconciles Auth deletion after response loss', asy
   const fake = fakeService({ finishFailureCount: 1 })
   const req = await reserve(fake)
   const userId = 'auth-to-delete'
-  fake.authUsers.set(userId, { id: userId, email: payload.admin_email, user_metadata: { nexasms_provisioning_request_id: requestId } })
+  fake.authUsers.set(userId, { id: userId, email: payload.admin_email, user_metadata: {}, app_metadata: { nexasms_provisioning_request_id: requestId } })
+  fake.identityMap.set(requestId, userId)
   fake.request!.auth_user_id = userId
   await markRecoverable(fake)
   await assertRejects(() => cancelProvisioningRequest(fake.service, requestId, 'operator-auth-id'))
@@ -358,7 +401,7 @@ Deno.test('cancellation retry reconciles Auth deletion after response loss', asy
   assertEquals(fake.request?.state, 'failed_terminal')
 })
 
-Deno.test('orphan Auth identity lookup is bound to the exact request marker', async () => {
+Deno.test('orphan Auth identity lookup requires the server-side request map', async () => {
   const fake = fakeService()
   await reserve(fake)
   fake.authUsers.set('unrelated', { id: 'unrelated', email: payload.admin_email, user_metadata: { nexasms_provisioning_request_id: 'another-request' } })
