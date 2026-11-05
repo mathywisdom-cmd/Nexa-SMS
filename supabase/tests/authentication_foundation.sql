@@ -41,6 +41,53 @@ begin
     raise exception 'users or schools table unexpectedly exposes direct reads';
   end if;
 
+  if not has_schema_privilege('service_role', 'auth', 'USAGE')
+     or not has_table_privilege('service_role', 'auth.users', 'SELECT')
+     or not has_table_privilege('service_role', 'public.users', 'SELECT')
+     or not has_table_privilege('service_role', 'public.users', 'INSERT')
+     or not has_table_privilege('service_role', 'public.schools', 'SELECT')
+     or not has_table_privilege('service_role', 'public.schools', 'INSERT')
+     or not has_table_privilege('service_role', 'public.roles', 'SELECT')
+     or not has_table_privilege('service_role', 'public.states', 'SELECT')
+     or not has_table_privilege('service_role', 'public.lgas', 'SELECT')
+     or not has_table_privilege('service_role', 'public.nationalities', 'SELECT')
+     or not has_table_privilege('service_role', 'public.staff_records', 'INSERT')
+     or not has_table_privilege('service_role', 'public.audit_logs', 'SELECT')
+     or not has_table_privilege('service_role', 'public.audit_logs', 'INSERT') then
+    raise exception 'trusted provisioning table privileges are incomplete';
+  end if;
+
+  if not has_sequence_privilege('service_role', pg_catalog.pg_get_serial_sequence('public.users', 'id'), 'USAGE')
+     or not has_sequence_privilege('service_role', pg_catalog.pg_get_serial_sequence('public.schools', 'id'), 'USAGE')
+     or not has_sequence_privilege('service_role', pg_catalog.pg_get_serial_sequence('public.staff_records', 'id'), 'USAGE')
+     or not has_sequence_privilege('service_role', pg_catalog.pg_get_serial_sequence('public.audit_logs', 'id'), 'USAGE') then
+    raise exception 'trusted provisioning sequence privileges are incomplete';
+  end if;
+
+  if has_table_privilege('service_role', 'public.users', 'UPDATE')
+     or has_table_privilege('service_role', 'public.users', 'DELETE')
+     or has_table_privilege('service_role', 'public.schools', 'UPDATE')
+     or has_table_privilege('service_role', 'public.schools', 'DELETE')
+     or has_table_privilege('service_role', 'public.staff_records', 'SELECT')
+     or has_table_privilege('service_role', 'public.staff_records', 'UPDATE')
+     or has_table_privilege('service_role', 'public.staff_records', 'DELETE')
+     or has_table_privilege('service_role', 'public.roles', 'INSERT')
+     or has_table_privilege('service_role', 'public.roles', 'UPDATE')
+     or has_table_privilege('service_role', 'public.roles', 'DELETE') then
+    raise exception 'trusted provisioning grants exceed the required table operations';
+  end if;
+
+  if has_table_privilege('anon', 'public.users', 'INSERT')
+     or has_table_privilege('authenticated', 'public.users', 'INSERT')
+     or has_table_privilege('anon', 'public.schools', 'INSERT')
+     or has_table_privilege('authenticated', 'public.schools', 'INSERT')
+     or has_table_privilege('anon', 'public.staff_records', 'INSERT')
+     or has_table_privilege('authenticated', 'public.staff_records', 'INSERT')
+     or has_table_privilege('anon', 'public.roles', 'INSERT')
+     or has_table_privilege('authenticated', 'public.roles', 'INSERT') then
+    raise exception 'browser role unexpectedly has a direct provisioning or role write privilege';
+  end if;
+
   if has_function_privilege('anon', 'public.provision_platform_owner_profile(uuid,uuid,text,uuid)', 'EXECUTE')
      or has_function_privilege('authenticated', 'public.provision_platform_owner_profile(uuid,uuid,text,uuid)', 'EXECUTE')
      or not has_function_privilege('service_role', 'public.provision_platform_owner_profile(uuid,uuid,text,uuid)', 'EXECUTE') then

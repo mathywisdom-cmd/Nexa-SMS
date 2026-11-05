@@ -104,6 +104,35 @@ grant select, insert, update on private.provisioning_requests to service_role;
 create index provisioning_requests_state_updated_idx on private.provisioning_requests(state, updated_at);
 create index provisioning_requests_actor_created_idx on private.provisioning_requests(actor_auth_user_id, created_at desc);
 
+-- The profile/school RPCs below are SECURITY INVOKER by design. Grant the
+-- service role only the base-table operations they execute; browser roles
+-- remain revoked and no RLS policies are added here. SECURITY INVOKER still
+-- runs with service_role's bypass-RLS capability, so its key must remain
+-- server-only and every write path must retain the actor/tenant checks below.
+grant usage on schema public, auth to service_role;
+grant select on auth.users to service_role;
+grant select, insert on public.users, public.schools to service_role;
+grant select on public.roles, public.states, public.lgas, public.nationalities to service_role;
+grant select, insert on public.audit_logs to service_role;
+grant insert on public.staff_records to service_role;
+
+-- Identity columns used by these writes need only their own backing sequences.
+do $provisioning_sequence_grants$
+declare
+  table_name text;
+  sequence_name text;
+begin
+  foreach table_name in array array[
+    'public.users', 'public.schools', 'public.audit_logs', 'public.staff_records'
+  ] loop
+    sequence_name := pg_catalog.pg_get_serial_sequence(table_name, 'id');
+    if sequence_name is not null then
+      execute pg_catalog.format('grant usage, select on sequence %s to service_role', sequence_name);
+    end if;
+  end loop;
+end
+$provisioning_sequence_grants$;
+
 create or replace function public.reserve_provisioning_request(
   p_request_id uuid,
   p_operation text,

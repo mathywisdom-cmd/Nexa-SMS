@@ -44,6 +44,10 @@ assert.match(sql, /profile_has_permission\(actor_profile_id,\s*'school\.manage'\
 assert.equal((sql.match(/set_config\('request\.jwt\.claim\.sub',\s*p_actor_auth_user_id::text,\s*true\)/gi) ?? []).length, 2,
   'school provisioning audit writes must bind only the SQL-verified actor as a transaction-local JWT subject')
 assert.match(sql, /create\s+table\s+private\.provisioning_requests/i)
+assert.match(sql, /grant\s+select,\s*insert\s+on\s+public\.users,\s*public\.schools\s+to\s+service_role/i)
+assert.match(sql, /grant\s+select\s+on\s+auth\.users\s+to\s+service_role/i)
+assert.match(sql, /grant\s+insert\s+on\s+public\.staff_records\s+to\s+service_role/i)
+assert.match(sql, /grant\s+select,\s*insert\s+on\s+public\.audit_logs\s+to\s+service_role/i)
 assert.match(sql, /request_row\.payload_hash\s*<>\s*p_payload_hash[\s\S]*?request_row\.state\s+not\s+in\s*\('completed',\s*'failed_terminal'\)\s+and\s+request_row\.payload\s*<>\s*p_payload/i,
   'completed or terminal idempotency retries must compare the retained payload hash after clearing payload data')
 assert.match(sql, /state\s*=\s*case\s+when\s+auth_user_id\s+is\s+null\s+then\s+'pending'\s+else\s+'identity_created'\s+end/i,
