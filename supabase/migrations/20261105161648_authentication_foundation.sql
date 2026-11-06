@@ -375,7 +375,10 @@ begin
   if p_request_id is null or p_source_hash is null or p_token_hash is null
      or p_payload is null or p_payload_hash is null
      or p_source_hash !~ '^[a-f0-9]{64}$' or p_token_hash !~ '^[a-f0-9]{64}$'
-     or jsonb_typeof(p_payload) <> 'object' or jsonb_object_length(p_payload) <> 2
+     or jsonb_typeof(p_payload) <> 'object'
+     or case when jsonb_typeof(p_payload) = 'object'
+             then (p_payload - 'email' - 'name') <> '{}'::jsonb
+             else false end
      or p_payload->>'email' is null or p_payload->>'name' is null
      or p_payload->>'email' !~ '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$'
      or length(p_payload->>'email') > 100 or length(p_payload->>'name') not between 6 and 150

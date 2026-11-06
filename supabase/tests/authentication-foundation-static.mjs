@@ -124,6 +124,10 @@ assert.deepEqual(parameterTypes.get('public.reserve_owner_bootstrap_request'), [
 ], 'owner bootstrap parameter types and order must match the migration contract')
 assert.match(sqlForAssertions, /p_payload->>'email'\s+is\s+null\s+or\s+p_payload->>'name'\s+is\s+null/i,
   'database bootstrap input validation must explicitly reject missing required values')
+assert.match(sqlForAssertions, /p_payload\s*-\s*'email'\s*-\s*'name'\s*<>\s*'\{\}'::jsonb/i,
+  'bootstrap payload must reject every key other than email and name')
+assert.doesNotMatch(sqlForAssertions, /jsonb_object_length\s*\(/i,
+  'bootstrap payload validation must use PostgreSQL-supported JSONB operations')
 assert.match(sqlForAssertions, /consumed_request_id\s+<>\s+p_request_id[\s\S]*?bootstrap_replayed/i)
 assert.match(sqlForAssertions, /owner bootstrap credential was not atomically consumed for this request/i)
 assert.match(sqlForAssertions, /private\.arm_owner_bootstrap_credential\(text, timestamptz\) owner to postgres/i)
